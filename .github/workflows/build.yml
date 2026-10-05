@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: npm run test:e2e
+      - run: npm run dist:mac
+      - uses: actions/upload-artifact@v4
+        with: { name: Bridge-mac, path: release/*.dmg }
+
+  build-windows:
+    # Not verified yet: builds the installer; run the app on Windows before relying on it.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - run: npm run dist:win
+      - uses: actions/upload-artifact@v4
+        with: { name: Bridge-windows, path: release/*.exe }
