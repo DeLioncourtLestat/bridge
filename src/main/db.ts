@@ -75,7 +75,7 @@ const toInstruction = (r: Row): Instruction => ({ id: r.id, projectId: r.project
 const toNote = (r: Row): Note => ({ id: r.id, projectId: r.project_id, title: r.title, body: r.body, createdAt: r.created_at })
 const toFork = (r: Row): Fork => ({
   id: r.id, projectId: r.project_id, title: r.title, branch: r.branch, path: r.path, open: !!r.open, sessionId: r.session_id,
-  sessionStarted: !!r.session_started, state: r.state, autoNamed: !!r.auto_named, autoBranch: !!r.auto_branch, ghost: !!r.ghost, instrOff: JSON.parse(r.instr_off ?? '[]'), createdAt: r.created_at,
+  sessionStarted: !!r.session_started, state: r.state, autoNamed: !!r.auto_named, autoBranch: !!r.auto_branch, ghost: !!r.ghost, instrOff: JSON.parse(r.instr_off ?? '[]'), instrSent: r.instr_sent ?? null, createdAt: r.created_at,
 })
 const toMessage = (r: Row): ChatMessage => ({
   id: r.id, forkId: r.fork_id, role: r.role, text: r.text, tools: JSON.parse(r.tools), marks: JSON.parse(r.marks ?? '[]'), refs: JSON.parse(r.refs), createdAt: r.created_at,
@@ -103,6 +103,7 @@ export function openDb(file: string) {
     db.exec("ALTER TABLE messages ADD COLUMN marks TEXT NOT NULL DEFAULT '[]'")
   if (!(db.pragma('table_info(projects)') as Row[]).some((c) => c.name === 'icon')) db.exec('ALTER TABLE projects ADD COLUMN icon TEXT')
   if (!(db.pragma('table_info(forks)') as Row[]).some((c) => c.name === 'ghost')) db.exec('ALTER TABLE forks ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0')
+  if (!(db.pragma('table_info(forks)') as Row[]).some((c) => c.name === 'instr_sent')) db.exec('ALTER TABLE forks ADD COLUMN instr_sent TEXT')
   if (!(db.pragma('table_info(forks)') as Row[]).some((c) => c.name === 'instr_off')) db.exec("ALTER TABLE forks ADD COLUMN instr_off TEXT NOT NULL DEFAULT '[]'")
   const now = () => Date.now()
 
@@ -192,7 +193,7 @@ export function openDb(file: string) {
       const r = db.prepare('SELECT * FROM forks WHERE id = ?').get(id) as Row | undefined
       return r && toFork(r)
     },
-    addFork: (f: Omit<Fork, 'ghost' | 'instrOff'> & { ghost?: boolean }) => {
+    addFork: (f: Omit<Fork, 'ghost' | 'instrOff' | 'instrSent'> & { ghost?: boolean }) => {
       db.prepare(
         `INSERT INTO forks (id, project_id, title, branch, path, open, session_id, session_started, state, auto_named, auto_branch, ghost, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -203,7 +204,7 @@ export function openDb(file: string) {
     updateFork: (id: string, patch: Partial<Fork>) =>
       update(db, 'forks', id, patch, {
         title: 'title', branch: 'branch', path: 'path', open: 'open', sessionStarted: 'session_started', state: 'state',
-        autoNamed: 'auto_named', autoBranch: 'auto_branch', instrOff: 'instr_off',
+        autoNamed: 'auto_named', autoBranch: 'auto_branch', instrOff: 'instr_off', instrSent: 'instr_sent',
       }),
 
     // chat messages

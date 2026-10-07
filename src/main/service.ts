@@ -5,6 +5,7 @@ import type { AgentEvent, Fork, Ref, Settings } from '../shared/types'
 import { colorFor, initials, slug, validBranch } from '../shared/util'
 import { addAccount, listAccounts, removeAccount, resolveAccount } from './accounts'
 import { AgentRunner, buildPrompt, refTitles } from './agent'
+import { forkInstructions, instructionsSig, instructionsUpdate } from './bridgeTools'
 import type { Repo } from './db'
 import * as g from './git'
 
@@ -31,27 +32,17 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
     return f
   }
 
-  function mcpConfigFor(projectId: string) {
+  function mcpConfigFor(projectId: string, forkId: string) {
     const t = agentTools()
     if (!t) return null
     return JSON.stringify({
       mcpServers: {
-        bridge: { type: 'stdio', command: t.node, args: [t.script], env: { ...t.env, BRIDGE_API: t.url, BRIDGE_TOKEN: t.token, BRIDGE_PROJECT: projectId } },
+        bridge: { type: 'stdio', command: t.node, args: [t.script], env: { ...t.env, BRIDGE_API: t.url, BRIDGE_TOKEN: t.token, BRIDGE_PROJECT: projectId, BRIDGE_FORK: forkId } },
       },
     })
   }
 
-  function instructionsText(f: Fork) {
-    const list = [
-      ...repo.listInstructions(f.projectId, null).filter((i) => !f.instrOff.includes(i.id)),
-      ...repo.listInstructions(f.projectId, f.id),
-    ].filter((i) => i.title.trim() || i.body.trim())
-    if (!list.length) return ''
-    return (
-      'The user\'s standing instructions for this project. Follow them in everything you do here, unless the user says otherwise in the chat.\n\n' +
-      list.map((i) => `## ${i.title.trim() || 'Instruction'}\n\n${i.body.trim()}`).join('\n\n')
-    )
-  }
+  const instructionsText = (f: Fork) => forkInstructions(repo, f)
 
   const searchDir = (t: SearchTarget) => (t.forkId ? fork(t.forkId).path : project(t.projectId).path)
 
@@ -179,7 +170,7 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
       const f: Fork = {
         id: randomUUID(), projectId: pid, title: title || `Fork ${n}`, branch, path: dir, open: true, sessionId: randomUUID(),
         sessionStarted: false, state: 'idle', autoNamed: !title, autoBranch: opts.newBranch && !!opts.branch.match(/^agent\/fork-\d+$/),
-        ghost: false, instrOff: [], createdAt: Date.now(),
+        ghost: false, instrOff: [], instrSent: null, createdAt: Date.now(),
       }
       return repo.addFork(f)
     },
@@ -231,15 +222,21 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
       emitAgent({ forkId, kind: 'start', messageId: agentMsg.id })
       const settings = repo.getSettings()
       const account = await accountFor(f.projectId)
+      // instructions: in the system prompt of a new session; a resumed one only gets them again when they changed
+      const instructions = instructionsText(f)
+      const sig = instructionsSig(instructions)
+      const changed = f.sessionStarted && sig !== (f.instrSent ?? instructionsSig(''))
+      const prompt = (changed ? instructionsUpdate(instructions) + '\n\n' : '') + buildPrompt(text, tasks, notes, f.ghost)
+      repo.updateFork(forkId, { instrSent: sig })
 
       agents
         .run({
           fork: f,
           account,
-          prompt: buildPrompt(text, tasks, notes, f.ghost),
+          prompt,
           permissionMode: settings.permissionMode,
-          mcpConfig: mcpConfigFor(f.projectId),
-          instructions: instructionsText(f),
+          mcpConfig: mcpConfigFor(f.projectId, f.id),
+          instructions,
           onSession: () => repo.updateFork(forkId, { sessionStarted: true }),
           onUpdate: (t, tools, marks) => emitAgent({ forkId, kind: 'update', message: repo.updateMessage(agentMsg.id, t, tools, marks) }),
         })

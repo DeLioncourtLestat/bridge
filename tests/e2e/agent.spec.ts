@@ -85,7 +85,7 @@ test('chat: the agent adds and changes tasks and notes through Bridge tools; no 
   // steps in the chat, and the tool answers the agent got back
   await expect(page.locator('.msg .trow')).toHaveText(['Saved note “Decision”', 'Created task “Add import”', 'Updated task #1', 'Completed task #99999'])
   const reply = page.locator('.msg:not(.me) .body')
-  await expect(reply).toContainText('Tools: list_tasks, create_task, update_task, list_notes, create_note, update_note')
+  await expect(reply).toContainText('Tools: list_tasks, create_task, update_task, list_instructions, list_notes, create_note, update_note')
   await expect(reply).toContainText('Saved note #1 “Decision”.')
   await expect(reply).toContainText('No task 99999 in this project')
   const call = sb.readLog().find((c) => c.mode === 'agent')

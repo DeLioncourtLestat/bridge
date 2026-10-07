@@ -10,6 +10,7 @@ import { BRIDGE_TOOLS } from './bridgeTools'
 const API = process.env.BRIDGE_API ?? ''
 const TOKEN = process.env.BRIDGE_TOKEN ?? ''
 const PROJECT = process.env.BRIDGE_PROJECT ?? ''
+const FORK = process.env.BRIDGE_FORK ?? ''
 
 const send = (msg: unknown) => process.stdout.write(JSON.stringify(msg) + '\n')
 
@@ -18,7 +19,7 @@ async function call(name: string, args: unknown): Promise<{ text: string; isErro
     const r = await fetch(`${API}/tool`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ projectId: PROJECT, name, args }),
+      body: JSON.stringify({ projectId: PROJECT, forkId: FORK || null, name, args }),
     })
     const body = (await r.json()) as { ok: boolean; text?: string; error?: string }
     return body.ok ? { text: body.text ?? 'Done.', isError: false } : { text: body.error ?? 'Failed', isError: true }

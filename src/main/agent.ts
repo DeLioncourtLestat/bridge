@@ -72,7 +72,8 @@ export function parseStreamLine(line: string): StreamEvent[] {
 export const BRIDGE_HINT =
   'You run inside Bridge, the user\'s project manager. The mcp__bridge__* tools manage this project\'s task list and notes in Bridge. ' +
   'When the user asks to add, change, finish or list tasks, or to write down, save or update a note, use those tools (not files in the repo). ' +
-  'You may also mark the attached task done with update_task when you have finished it.'
+  'You may also mark the attached task done with update_task when you have finished it. ' +
+  'Standing instructions the user set in Bridge come in this system prompt or in a <bridge-instructions> block of a message; list_instructions shows the ones in force now.'
 
 /** One --append-system-prompt: the Bridge tools hint (when the tools are there) and the instructions. */
 function appendPrompt(opts: { mcpConfig?: string | null; instructions?: string }) {

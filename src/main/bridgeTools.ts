@@ -1,4 +1,5 @@
-import type { Priority, TaskStatus } from '../shared/types'
+import { createHash } from 'node:crypto'
+import type { Fork, Priority, TaskStatus } from '../shared/types'
 import type { Repo } from './db'
 
 /** Tools the agent gets for the project's tasks and notes (served by mcp.ts as `mcp__bridge__*`). */
@@ -37,6 +38,11 @@ export const BRIDGE_TOOLS = [
     },
   },
   {
+    name: 'list_instructions',
+    description: 'Show the standing instructions from Bridge that apply to you right now (project ones enabled for this fork, plus fork-only ones). Use when the user asks about instructions, rules or guidelines set in Bridge.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'list_notes',
     description: 'List the notes of this project in Bridge (id, title, first line). Pass id to read one note in full.',
     inputSchema: { type: 'object', properties: { id: { type: 'number', description: 'Read this note in full' } } },
@@ -63,12 +69,38 @@ export const BRIDGE_TOOLS = [
 
 export class ToolError extends Error {}
 
+/** What a fork's agent must follow: the project's instructions not switched off there, then the fork's own. '' when none. */
+export function forkInstructions(repo: Repo, f: Fork) {
+  const list = [
+    ...repo.listInstructions(f.projectId, null).filter((i) => !f.instrOff.includes(i.id)),
+    ...repo.listInstructions(f.projectId, f.id),
+  ].filter((i) => i.title.trim() || i.body.trim())
+  if (!list.length) return ''
+  return (
+    "The user's standing instructions for this project (set in Bridge). Follow them in everything you do here, unless the user says otherwise in the chat.\n\n" +
+    list.map((i) => `## ${i.title.trim() || 'Instruction'}\n\n${i.body.trim()}`).join('\n\n')
+  )
+}
+
+/** Short signature of an instructions text, to tell whether a session already has it. */
+export const instructionsSig = (text: string) => createHash('sha1').update(text).digest('hex').slice(0, 16)
+
+/**
+ * A resumed Claude session keeps the system prompt it started with (a new --append-system-prompt is ignored),
+ * so changed instructions travel in the message itself.
+ */
+export function instructionsUpdate(text: string) {
+  return text
+    ? `<bridge-instructions>\nThe standing instructions changed. These replace any earlier ones from Bridge:\n\n${text}\n</bridge-instructions>`
+    : '<bridge-instructions>\nThe user removed all standing instructions in Bridge; earlier ones no longer apply.\n</bridge-instructions>'
+}
+
 const STATUSES: TaskStatus[] = ['open', 'progress', 'done']
 const PRIORITIES: Priority[] = ['high', 'med', 'low']
 const str = (v: unknown, max = 10_000) => (typeof v === 'string' ? v.slice(0, max) : undefined)
 
 /** Run one tool for a project; returns the text the agent sees. Throws ToolError for bad input. */
-export function runBridgeTool(repo: Repo, projectId: string, name: string, a: Record<string, unknown>): string {
+export function runBridgeTool(repo: Repo, projectId: string, name: string, a: Record<string, unknown>, forkId?: string | null): string {
   if (!repo.getProject(projectId)) throw new ToolError('Unknown project')
   const task = (id: unknown) => {
     const t = repo.getTask(Number(id))
@@ -104,6 +136,12 @@ export function runBridgeTool(repo: Repo, projectId: string, name: string, a: Re
       repo.updateTask(t.id, patch)
       const u = repo.getTask(t.id)!
       return `Updated task #${u.id} “${u.title}”: ${Object.keys(patch).join(', ')} (${u.status}, ${u.priority}).`
+    }
+    case 'list_instructions': {
+      const f = forkId ? repo.getFork(forkId) : undefined
+      if (f && f.projectId === projectId) return forkInstructions(repo, f) || 'No standing instructions are set for this fork.'
+      const list = repo.listInstructions(projectId, null)
+      return list.length ? list.map((i) => `## ${i.title || 'Instruction'}\n\n${i.body}`).join('\n\n') : 'No standing instructions in this project.'
     }
     case 'list_notes': {
       if (a.id !== undefined) { const n = note(a.id); return `# ${n.title}\n\n${n.body}` }
@@ -141,6 +179,7 @@ export function bridgeToolSummary(name: string, input: any): string {
     case 'create_note': return `Saved note ${q(input?.title)}`
     case 'update_note': return `Updated note #${input?.id}`
     case 'list_notes': return input?.id !== undefined ? `Read note #${input.id}` : 'Listed notes'
+    case 'list_instructions': return 'Read instructions'
     default: return name
   }
 }

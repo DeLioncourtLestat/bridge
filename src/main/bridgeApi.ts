@@ -20,8 +20,8 @@ export function startBridgeApi(repo: Repo, onChanged: (projectId: string) => voi
     req.on('data', (d: Buffer) => { raw += d.toString(); if (raw.length > 1_000_000) req.destroy() })
     req.on('end', () => {
       try {
-        const { projectId, name, args } = JSON.parse(raw)
-        const text = runBridgeTool(repo, String(projectId), String(name), args && typeof args === 'object' ? args : {})
+        const { projectId, forkId, name, args } = JSON.parse(raw)
+        const text = runBridgeTool(repo, String(projectId), String(name), args && typeof args === 'object' ? args : {}, forkId ? String(forkId) : null)
         if (!/^list_/.test(name)) onChanged(String(projectId))
         reply(200, { ok: true, text })
       } catch (e) {

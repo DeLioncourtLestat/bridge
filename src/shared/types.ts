@@ -49,6 +49,8 @@ export type Fork = {
   ghost: boolean
   /** Project instructions switched off for this fork. */
   instrOff: number[]
+  /** Signature of the instructions this fork's agent session last received. */
+  instrSent: string | null
   createdAt: number
 }
 

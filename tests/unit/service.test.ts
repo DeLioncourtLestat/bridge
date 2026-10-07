@@ -223,7 +223,7 @@ describe('service', () => {
     expect(call.allowed).toBe('mcp__bridge')
     expect(call.hint).toMatch(/mcp__bridge__\* tools manage this project/)
     expect(JSON.parse(call.mcp)).toEqual({ mcpServers: { bridge: { type: 'stdio', command: '/bin/node', args: ['/app/mcp.js'],
-      env: { ELECTRON_RUN_AS_NODE: '1', BRIDGE_API: 'http://127.0.0.1:1', BRIDGE_TOKEN: 'tok', BRIDGE_PROJECT: p.id } } } })
+      env: { ELECTRON_RUN_AS_NODE: '1', BRIDGE_API: 'http://127.0.0.1:1', BRIDGE_TOKEN: 'tok', BRIDGE_PROJECT: p.id, BRIDGE_FORK: g.id } } } })
   })
 
   it('instructions: project ones for every fork unless switched off there, plus the fork’s own, sent to the agent', async () => {
@@ -237,7 +237,7 @@ describe('service', () => {
     const b = await svc.createGhost(p.id)
     svc.createInstruction(p.id, { forkId: a.id, title: 'Scope', body: 'Only touch app/models.' })
     svc.setInstructionOn(a.id, lang.id, false)
-    expect(svc.instructionsFor(a.id)).toBe("The user's standing instructions for this project. Follow them in everything you do here, unless the user says otherwise in the chat.\n\n## Tests\n\nUse RSpec, not Minitest.\n\n## Scope\n\nOnly touch app/models.")
+    expect(svc.instructionsFor(a.id)).toBe("The user's standing instructions for this project (set in Bridge). Follow them in everything you do here, unless the user says otherwise in the chat.\n\n## Tests\n\nUse RSpec, not Minitest.\n\n## Scope\n\nOnly touch app/models.")
     expect(svc.instructionsFor(b.id)).toContain('## Language')
     expect(svc.instructionsFor(b.id)).not.toContain('Scope')
     expect(svc.listForkInstructions(b.id)).toEqual([])
@@ -253,6 +253,32 @@ describe('service', () => {
     svc.removeInstruction(rspec.id)
     expect(svc.instructionsFor(a.id)).not.toContain('RSpec')
     expect(() => svc.createInstruction(p.id, { forkId: 'nope' })).toThrow('Fork not found')
+  })
+
+  it('a resumed session gets the instructions again in the message, only when they changed', async () => {
+    const { svc, done } = setup()
+    const { dir } = repo()
+    const p = await svc.addProject(dir)
+    const g = await svc.createGhost(p.id)
+    const turn = async (text: string, n: number) => { await svc.send(g.id, text, []); await done(g.id, n); return readLog()[n - 1] }
+    // first turn: new session, nothing set yet
+    let c = await turn('one', 1)
+    expect(c.resume).toBe(false)
+    expect(c.prompt).toBe('Note: you work directly in the main project folder. Other agents may be editing files here at the same time. Do not revert, reformat or stash changes you did not make, and do not switch branches.\n\none')
+    // an instruction added mid-session reaches the resumed session through the message
+    const inc = svc.createInstruction(p.id, { title: 'Incidents', body: 'You handle import incidents.' })
+    c = await turn('find the incidents instruction', 2)
+    expect(c.resume).toBe(true)
+    expect(c.prompt).toMatch(/^<bridge-instructions>\nThe standing instructions changed\. These replace any earlier ones from Bridge:\n\n.*## Incidents\n\nYou handle import incidents\.\n<\/bridge-instructions>\n\nNote: you work/s)
+    // unchanged → not repeated
+    c = await turn('three', 3)
+    expect(c.prompt).not.toContain('bridge-instructions')
+    // switched off here → the session is told
+    svc.setInstructionOn(g.id, inc.id, false)
+    c = await turn('four', 4)
+    expect(c.prompt).toMatch(/^<bridge-instructions>\nThe user removed all standing instructions in Bridge/)
+    // the chat shows only what the user typed
+    expect(svc.messages(g.id).filter((m) => m.role === 'user').map((m) => m.text)).toEqual(['one', 'find the incidents instruction', 'three', 'four'])
   })
 
   it('the done notice names the fork and quotes the reply; unseen forks are counted', async () => {
@@ -297,6 +323,8 @@ describe('service', () => {
     expect(await call('create_task', {})).toEqual({ ok: false, error: 'title is required' })
     expect(await call('drop_table', {})).toEqual({ ok: false, error: 'Unknown tool drop_table' })
     expect((await fetch(`${api.url}/tool`, { method: 'POST', headers: { authorization: 'Bearer nope' }, body: '{}' })).status).toBe(401)
+    db.createInstruction('p', null, { title: 'Incidents', body: 'Handle imports.' })
+    expect((await call('list_instructions', {})).text).toBe('## Incidents\n\nHandle imports.')
     expect(changed).toEqual(['p', 'p', 'p', 'p'])
     await api.close()
   })
