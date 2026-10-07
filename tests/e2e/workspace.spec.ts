@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import fs from 'node:fs'
 import path from 'node:path'
-import { addProject, git, launch, makeSandbox } from './helpers'
+import { addProject, git, launch, makeSandbox, menu } from './helpers'
 
 async function forkWithAgentWork(sb: ReturnType<typeof makeSandbox>) {
   const r = await launch(sb)
@@ -31,11 +31,11 @@ test('changes and explorer: diffs, open in explorer, edit with highlight and aut
   await expect(page.locator('[data-file="README.md"] .st')).toHaveText('M')
   await expect(page.locator('[data-file="AGENT_WORK.md"] .st')).toHaveText('A')
   // folders first in the tree
-  await expect(page.locator('.llist .fi').first()).toHaveText('src/')
+  await expect(page.locator('.llist .fi').first()).toHaveText('src')
   await expect(page.locator('.cm-changed-line')).toHaveCount(2)
 
   // edit app.ts by hand: saved to disk, changed line highlighted, counted in Changes
-  await page.click('[data-file="src/app.ts"]')
+  await page.click('[data-dir="src"]'); await page.click('[data-file="src/app.ts"]')
   await expect(page.locator('.cm-content')).toContainText('export const answer = 42')
   await expect(page.locator('.cm-changed-line')).toHaveCount(0)
   await page.locator('.cm-line').first().click()
@@ -123,5 +123,73 @@ test('terminals: real shell in the fork folder, rename, close, persist', async (
   await page.click('[data-v="term"]')
   await expect(page.locator('[data-term]')).toHaveText(['dev-server'])
   await expect(page.locator('.xterm-rows')).toContainText('marker-42')
+  await app.close()
+})
+
+test('explorer folders collapse; go to file, find in files, rebinding shortcuts', async () => {
+  const sb = makeSandbox()
+  const { app, page } = await forkWithAgentWork(sb)
+  await page.click('[data-v="files"]')
+
+  // folders start collapsed and toggle
+  await expect(page.locator('[data-dir="src"]')).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.locator('[data-file="src/app.ts"]')).toHaveCount(0)
+  await page.click('[data-dir="src"]')
+  await expect(page.locator('[data-file="src/app.ts"]')).toBeVisible()
+  await expect(page.locator('[data-dir="src/lib"]')).toHaveAttribute('aria-expanded', 'false')
+  await page.click('[data-dir="src"]')
+  await expect(page.locator('[data-file="src/app.ts"]')).toHaveCount(0)
+
+  // Go to File: fuzzy name, opens in the Explorer with its folders unfolded
+  expect(await menu(app, 'Go to File…', false)).toBe('CmdOrCtrl+Shift+O')
+  await menu(app, 'Go to File…')
+  await page.fill('#searchInput', 'utl')
+  await expect(page.locator('.sr').first()).toHaveAttribute('data-result', 'src/lib/util.ts')
+  await page.press('#searchInput', 'Enter')
+  await expect(page.locator('.spop')).toHaveCount(0)
+  await expect(page.locator('[data-file="src/lib/util.ts"]')).toHaveAttribute('aria-current', 'true')
+  await expect(page.locator('[data-dir="src/lib"]')).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('.cm-content')).toContainText('twice')
+
+  // Find in Files: text, preview, jump to the line
+  expect(await menu(app, 'Find in Files…', false)).toBe('CmdOrCtrl+Shift+F')
+  await menu(app, 'Find in Files…')
+  await page.fill('#searchInput', 'hello,')
+  await expect(page.locator('.sr.hit')).toHaveCount(1)
+  await expect(page.locator('.sr.hit')).toHaveAttribute('data-result', 'src/app.ts:4')
+  await expect(page.locator('.sr.hit mark')).toHaveText('Hello,')
+  await expect(page.locator('.speek .hitl')).toContainText('return')
+  await page.click('#optCase')
+  await expect(page.locator('.sempty')).toHaveText('Nothing found')
+  await page.click('#optCase')
+  await page.click('#optRegex')
+  await page.fill('#searchInput', 'answer = \\d+')
+  await expect(page.locator('.sr.hit')).toHaveAttribute('data-result', 'src/app.ts:1')
+  await page.fill('#searchInput', 'Hello, \\$')
+  await expect(page.locator('.sr.hit')).toHaveAttribute('data-result', 'src/app.ts:4')
+  await page.press('#searchInput', 'Enter')
+  await expect(page.locator('[data-file="src/app.ts"]')).toHaveAttribute('aria-current', 'true')
+  await expect(page.locator('.cm-activeLine')).toContainText('return')
+
+  // rebind Go to File in Settings → Keymap; the menu follows
+  await page.click('#openSettings')
+  await page.click('[data-sec="keymap"]')
+  await page.click('[data-key="go-to-file"]')
+  await expect(page.locator('[data-key="go-to-file"]')).toHaveText('Press keys…')
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Shift+KeyP' : 'Control+Shift+KeyP')
+  await expect.poll(() => menu(app, 'Go to File…', false)).toBe('CmdOrCtrl+Shift+P')
+  await page.click('[data-key="find-in-files"]')
+  await page.keyboard.press('Backspace')
+  await expect(page.locator('[data-key="find-in-files"]')).toHaveText('None')
+  await expect.poll(() => menu(app, 'Find in Files…', false)).toBe(null)
+  await page.click('[data-kreset="find-in-files"]')
+  await expect.poll(() => menu(app, 'Find in Files…', false)).toBe('CmdOrCtrl+Shift+F')
+  await page.keyboard.press('Escape')
+
+  // outside a fork the search is a preview of the project folder
+  await page.click('[data-tab="tasks"]')
+  await menu(app, 'Go to File…')
+  await expect(page.locator('.sfoot')).toContainText('Preview only')
+  await expect(page.locator('.sr').first()).toBeVisible()
   await app.close()
 })

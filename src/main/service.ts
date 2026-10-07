@@ -5,14 +5,18 @@ import type { AgentEvent, Fork, Ref, Settings } from '../shared/types'
 import { colorFor, initials, slug, validBranch } from '../shared/util'
 import { addAccount, listAccounts, removeAccount, resolveAccount } from './accounts'
 import { AgentRunner, buildPrompt, refTitles } from './agent'
-import { askAssistant } from './assistant'
 import type { Repo } from './db'
 import * as g from './git'
 
 export class UserError extends Error {}
 
 /** Everything the window can ask for. Kept free of Electron so tests can drive it directly. */
-export function createService(repo: Repo, emit: (channel: string, payload: unknown) => void) {
+export type SearchTarget = { projectId: string; forkId?: string | null }
+
+/** Where the agent's MCP server reaches Bridge: the node binary, the script, and the local API. */
+export type AgentTools = { node: string; script: string; url: string; token: string; env?: Record<string, string> }
+
+export function createService(repo: Repo, emit: (channel: string, payload: unknown) => void, agentTools: () => AgentTools | null = () => null) {
   const agents = new AgentRunner()
   const emitAgent = (e: AgentEvent) => emit('agent:event', e)
 
@@ -26,6 +30,30 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
     if (!f) throw new UserError('Fork not found')
     return f
   }
+
+  function mcpConfigFor(projectId: string) {
+    const t = agentTools()
+    if (!t) return null
+    return JSON.stringify({
+      mcpServers: {
+        bridge: { type: 'stdio', command: t.node, args: [t.script], env: { ...t.env, BRIDGE_API: t.url, BRIDGE_TOKEN: t.token, BRIDGE_PROJECT: projectId } },
+      },
+    })
+  }
+
+  function instructionsText(f: Fork) {
+    const list = [
+      ...repo.listInstructions(f.projectId, null).filter((i) => !f.instrOff.includes(i.id)),
+      ...repo.listInstructions(f.projectId, f.id),
+    ].filter((i) => i.title.trim() || i.body.trim())
+    if (!list.length) return ''
+    return (
+      'The user\'s standing instructions for this project. Follow them in everything you do here, unless the user says otherwise in the chat.\n\n' +
+      list.map((i) => `## ${i.title.trim() || 'Instruction'}\n\n${i.body.trim()}`).join('\n\n')
+    )
+  }
+
+  const searchDir = (t: SearchTarget) => (t.forkId ? fork(t.forkId).path : project(t.projectId).path)
 
   async function accountFor(projectId: string) {
     const accounts = await listAccounts(repo)
@@ -50,7 +78,7 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
         throw new UserError('This repository has no commits yet. Make a first commit, then add it again.')
       }
       const name = path.basename(root)
-      return repo.addProject({ id: randomUUID(), name, path: root, short: initials(name), color: colorFor(name), account: null })
+      return repo.addProject({ id: randomUUID(), name, path: root, short: initials(name), color: colorFor(name), icon: null, account: null })
     },
 
     /** Turn a plain folder into a repo with one empty commit, so forks can branch from it. */
@@ -60,7 +88,7 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
       return svc.addProject(dir)
     },
 
-    updateProject: (id: string, patch: { account?: string | null; color?: string; short?: string; name?: string }) => {
+    updateProject: (id: string, patch: { account?: string | null; color?: string; icon?: string | null; short?: string; name?: string }) => {
       repo.updateProject(id, patch)
       return project(id)
     },
@@ -80,8 +108,39 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
     updateNote: (id: number, patch: Parameters<Repo['updateNote']>[1]) => { repo.updateNote(id, patch); return repo.getNote(id) },
     removeNote: (id: number) => repo.removeNote(id),
 
+    // ---------- instructions ----------
+    listInstructions: (pid: string) => repo.listInstructions(pid, null),
+    listForkInstructions: (forkId: string) => { const f = fork(forkId); return repo.listInstructions(f.projectId, f.id) },
+    createInstruction(pid: string, data: { forkId?: string | null; title?: string; body?: string } = {}) {
+      project(pid)
+      if (data.forkId && fork(data.forkId).projectId !== pid) throw new UserError('Fork not found')
+      return repo.createInstruction(pid, data.forkId ?? null, data)
+    },
+    updateInstruction: (id: number, patch: { title?: string; body?: string }) => { repo.updateInstruction(id, patch); return repo.getInstruction(id) },
+    removeInstruction: (id: number) => repo.removeInstruction(id),
+    /** Switch one of the project's instructions on or off for this fork only. */
+    setInstructionOn(forkId: string, id: number, on: boolean) {
+      const f = fork(forkId)
+      const off = new Set(f.instrOff)
+      if (on) off.delete(id)
+      else off.add(id)
+      repo.updateFork(forkId, { instrOff: [...off] })
+      return fork(forkId)
+    },
+    /** What the agent of this fork is told to follow: enabled project instructions, then the fork's own. */
+    instructionsFor: (forkId: string) => instructionsText(fork(forkId)),
+
     // ---------- forks ----------
-    listForks: (pid: string) => repo.listForks(pid),
+    /** Ghosts follow whatever branch the project folder has checked out right now. */
+    async listForks(pid: string) {
+      const forks = repo.listForks(pid)
+      for (const f of forks) {
+        if (!f.ghost) continue
+        const branch = await g.currentBranch(f.path).catch(() => f.branch)
+        if (branch !== f.branch) { repo.updateFork(f.id, { branch }); f.branch = branch }
+      }
+      return forks
+    },
 
     /** Every local branch and why it can't be used (already checked out somewhere). */
     async branches(pid: string) {
@@ -120,9 +179,21 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
       const f: Fork = {
         id: randomUUID(), projectId: pid, title: title || `Fork ${n}`, branch, path: dir, open: true, sessionId: randomUUID(),
         sessionStarted: false, state: 'idle', autoNamed: !title, autoBranch: opts.newBranch && !!opts.branch.match(/^agent\/fork-\d+$/),
-        createdAt: Date.now(),
+        ghost: false, instrOff: [], createdAt: Date.now(),
       }
       return repo.addFork(f)
+    },
+
+    /** An agent window in the project folder itself: no worktree, shares the branch with the user and other ghosts. */
+    async createGhost(pid: string, opts: { title?: string } = {}) {
+      const p = project(pid)
+      const branch = await g.currentBranch(p.path)
+      const n = repo.listForks(pid).filter((f) => f.ghost).length + 1
+      const title = opts.title?.trim()
+      return repo.addFork({
+        id: randomUUID(), projectId: pid, title: title || `Ghost ${n}`, branch, path: p.path, open: true, sessionId: randomUUID(),
+        sessionStarted: false, state: 'idle', autoNamed: !title, autoBranch: false, ghost: true, createdAt: Date.now(),
+      })
     },
 
     setForkOpen: (id: string, open: boolean) => { repo.updateFork(id, { open }); return fork(id) },
@@ -165,10 +236,12 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
         .run({
           fork: f,
           account,
-          prompt: buildPrompt(text, tasks, notes),
+          prompt: buildPrompt(text, tasks, notes, f.ghost),
           permissionMode: settings.permissionMode,
+          mcpConfig: mcpConfigFor(f.projectId),
+          instructions: instructionsText(f),
           onSession: () => repo.updateFork(forkId, { sessionStarted: true }),
-          onUpdate: (t, tools) => emitAgent({ forkId, kind: 'update', message: repo.updateMessage(agentMsg.id, t, tools) }),
+          onUpdate: (t, tools, marks) => emitAgent({ forkId, kind: 'update', message: repo.updateMessage(agentMsg.id, t, tools, marks) }),
         })
         .then((res) => {
           if (!res.ok) repo.addMessage(forkId, 'error', res.error || 'The agent failed')
@@ -187,6 +260,18 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
       if (f.state === 'wait') repo.updateFork(forkId, { state: 'idle' })
     },
 
+    // ---------- search (a fork's folder, or the project folder when no fork is open) ----------
+    searchFiles: (t: SearchTarget) => g.listFiles(searchDir(t)),
+    async grep(t: SearchTarget, query: string, opts: { caseSensitive?: boolean; regex?: boolean } = {}) {
+      if (!query.trim()) return { hits: [], truncated: false }
+      try {
+        return await g.grep(searchDir(t), query, opts)
+      } catch (e) {
+        throw new UserError(opts.regex ? `Invalid search: ${(e as Error).message}` : (e as Error).message)
+      }
+    },
+    peekFile: (t: SearchTarget, file: string) => g.readFile(searchDir(t), file),
+
     // ---------- git inside a fork ----------
     status: (forkId: string) => g.status(fork(forkId).path),
     files: (forkId: string) => g.listFiles(fork(forkId).path),
@@ -202,43 +287,6 @@ export function createService(repo: Repo, emit: (channel: string, payload: unkno
     push: (forkId: string) => g.push(fork(forkId).path),
     pull: (forkId: string) => g.pull(fork(forkId).path),
     ahead: (forkId: string) => g.aheadCount(fork(forkId).path),
-
-    // ---------- assistant ----------
-    assistantHistory: (pid: string) => repo.listAssistant(pid),
-
-    async assistantSend(pid: string, text: string) {
-      const p = project(pid)
-      repo.addAssistant(pid, 'user', text)
-      const open = repo.listTasks(pid).filter((t) => t.status !== 'done')
-      const res = await askAssistant(text, p.path, await accountFor(pid), open)
-      const tools: string[] = []
-      const lines: string[] = []
-      let openRef: Ref | null = null
-      for (const a of res.actions) {
-        if (a.type === 'create_task') {
-          const t = repo.createTask(pid, { title: a.title, description: a.description ?? '', priority: a.priority ?? 'med' })
-          tools.push(`create_task(title: "${t.title}", priority: ${t.priority})`)
-          lines.push(`Created task **${t.title}** · ${({ high: 'high', med: 'medium', low: 'low' } as const)[t.priority]} priority.`)
-          openRef ??= { kind: 'task', id: t.id, title: t.title }
-        } else if (a.type === 'create_note') {
-          const n = repo.createNote(pid, { title: a.title, body: a.body ?? '' })
-          tools.push(`create_note(title: "${n.title}")`)
-          lines.push(`Saved note **${n.title}**.`)
-          openRef ??= { kind: 'note', id: n.id, title: n.title }
-        } else {
-          const list = repo.listTasks(pid).filter((t) => t.status !== 'done')
-          tools.push('list_tasks(status: open)')
-          lines.push(list.length ? `${list.length} open: ${list.map((t) => `**${t.title}**`).join(', ')}.` : 'No open tasks.')
-        }
-      }
-      let reply = lines.join('\n')
-      if (!res.offline && res.reply && !res.actions.some((a) => a.type === 'list_tasks')) reply = lines.length ? reply : res.reply
-      if (!reply)
-        reply = res.offline
-          ? 'I can add tasks and notes here. Try “Create task fix week start, urgent” or “Note: Supabase — keep tokens server-side”.'
-          : res.reply || 'Done.'
-      return repo.addAssistant(pid, 'assistant', reply, tools, openRef)
-    },
 
     // ---------- accounts & settings ----------
     listAccounts: () => listAccounts(repo),

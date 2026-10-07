@@ -3,6 +3,8 @@ import path from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { openDb } from '../../src/main/db'
 import { worktreeDir } from '../../src/main/git'
+import { startBridgeApi } from '../../src/main/bridgeApi'
+import { doneNotice, unseenCount } from '../../src/main/notify'
 import { createService } from '../../src/main/service'
 import type { AgentEvent } from '../../src/shared/types'
 import { repo, sh, tmp } from './tmp'
@@ -74,7 +76,7 @@ describe('service', () => {
     const g = await svc.createFork(p.id, { branch: 'feature/x', newBranch: false })
     expect(g).toMatchObject({ title: 'Fork 2', branch: 'feature/x', autoNamed: true, autoBranch: false })
     svc.setForkOpen(g.id, false)
-    expect(svc.listForks(p.id).find((x) => x.id === g.id)!.open).toBe(false)
+    expect((await svc.listForks(p.id)).find((x) => x.id === g.id)!.open).toBe(false)
     // folder name collision gets a suffix
     fs.mkdirSync(worktreeDir(dir, 'agent/clash'), { recursive: true })
     expect((await svc.createFork(p.id, { branch: 'agent/clash', newBranch: true })).path).toBe(worktreeDir(dir, 'agent/clash') + '-2')
@@ -101,7 +103,7 @@ describe('service', () => {
     expect(msgs.map((m) => m.role)).toEqual(['user', 'agent'])
     expect(msgs[1].tools).toEqual(['Read README.md', 'Wrote AGENT_WORK.md', 'Edited README.md'])
     expect(msgs[1].text).toContain('Done.')
-    expect(svc.listForks(p.id)[0]).toMatchObject({ state: 'wait', sessionStarted: true })
+    expect((await svc.listForks(p.id))[0]).toMatchObject({ state: 'wait', sessionStarted: true })
     expect(events.some((e) => e.kind === 'update')).toBe(true)
     expect((await svc.status(f.id)).map((c) => c.path)).toEqual(['AGENT_WORK.md', 'README.md'])
     // second turn resumes the same session
@@ -109,7 +111,7 @@ describe('service', () => {
     await done(f.id, 2)
     expect(readLog()[1]).toMatchObject({ session: f.sessionId, resume: true })
     svc.markSeen(f.id)
-    expect(svc.listForks(p.id)[0].state).toBe('idle')
+    expect((await svc.listForks(p.id))[0].state).toBe('idle')
   })
 
   it('uses the default account when the project has none', async () => {
@@ -131,11 +133,30 @@ describe('service', () => {
     const f = await svc.createFork(p.id, { branch: 'agent/fork-1', newBranch: true })
     expect(f).toMatchObject({ title: 'Fork 1', autoNamed: true, autoBranch: true })
     await svc.send(f.id, '', [{ kind: 'task', id: t.id }])
-    const after = svc.listForks(p.id)[0]
+    const after = (await svc.listForks(p.id))[0]
     expect(after).toMatchObject({ title: 'Recurring events', branch: 'agent/recurring-events', path: worktreeDir(dir, 'agent/recurring-events') })
     expect(fs.existsSync(f.path)).toBe(false)
     await done(f.id)
     expect(fs.realpathSync(readLog()[0].cwd)).toBe(fs.realpathSync(after.path))
+  })
+
+  it('ghosts run in the project folder on its branch, several at once, and follow branch switches', async () => {
+    const { svc, done } = setup()
+    const { dir } = repo()
+    const p = await svc.addProject(dir)
+    const a = await svc.createGhost(p.id)
+    const b = await svc.createGhost(p.id, { title: 'Header' })
+    expect(a).toMatchObject({ title: 'Ghost 1', ghost: true, path: dir, branch: 'main' })
+    expect(b).toMatchObject({ title: 'Header', ghost: true, path: dir, branch: 'main' })
+    await svc.send(a.id, 'one', [])
+    await svc.send(b.id, 'two', [])
+    await Promise.all([done(a.id), done(b.id)])
+    const log = readLog()
+    expect(log.map((l) => fs.realpathSync(l.cwd))).toEqual([fs.realpathSync(dir), fs.realpathSync(dir)])
+    expect(log[0].prompt).toMatch(/^Note: you work directly in the main project folder/)
+    expect(new Set(log.map((l) => l.session)).size).toBe(2)
+    sh(dir, 'checkout', '-q', '-b', 'feature/ghosts')
+    expect((await svc.listForks(p.id)).map((f) => f.branch)).toEqual(['feature/ghosts', 'feature/ghosts'])
   })
 
   it('reports agent failures and lets you stop a run', async () => {
@@ -147,12 +168,30 @@ describe('service', () => {
     await done(f.id)
     expect(svc.messages(f.id).map((m) => m.role)).toEqual(['user', 'error'])
     expect(svc.messages(f.id)[1].text).toBe('Simulated failure')
-    expect(svc.listForks(p.id)[0].state).toBe('idle')
+    expect((await svc.listForks(p.id))[0].state).toBe('idle')
     await svc.send(f.id, 'SLOW job', [])
     await expect(svc.send(f.id, 'again', [])).rejects.toThrow(/still working/)
     svc.stop(f.id)
     await done(f.id, 2)
     expect(svc.agents.isRunning(f.id)).toBe(false)
+  })
+
+  it('searches file names and text in the project folder or a fork', async () => {
+    const { svc } = setup()
+    const { dir } = repo()
+    const p = await svc.addProject(dir)
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'Untracked Needle here\n')
+    fs.writeFileSync(path.join(dir, 'node_modules'), 'needle ignored\n')
+    const t = { projectId: p.id }
+    expect(await svc.searchFiles(t)).toEqual(expect.arrayContaining(['README.md', 'src/a.ts', 'notes.txt']))
+    expect((await svc.grep(t, 'needle')).hits).toEqual([{ file: 'notes.txt', line: 1, text: 'Untracked Needle here' }])
+    expect((await svc.grep(t, 'needle', { caseSensitive: true })).hits).toEqual([])
+    expect((await svc.grep(t, 'const a = \\d', { regex: true })).hits).toMatchObject([{ file: 'src/a.ts', line: 1 }])
+    expect((await svc.grep(t, '   ')).hits).toEqual([])
+    await expect(svc.grep(t, '(', { regex: true })).rejects.toThrow(/Invalid search/)
+    expect(await svc.peekFile(t, 'src/a.ts')).toBe('export const a = 1\n')
+    const f = await svc.createFork(p.id, { title: 'x', branch: 'agent/x', newBranch: true })
+    expect((await svc.grep({ projectId: p.id, forkId: f.id }, 'needle')).hits).toEqual([])
   })
 
   it('reads, writes, commits and pushes inside a fork', async () => {
@@ -171,34 +210,94 @@ describe('service', () => {
     expect(sh(dir, 'log', '--format=%s', '-1').trim()).toBe('second') // main untouched
   })
 
-  it('the assistant turns requests into tasks and notes', async () => {
-    const { svc } = setup()
+  it('gives the agent Bridge tools through --mcp-config when the API is up', async () => {
+    const events: AgentEvent[] = []
+    const svc = createService(openDb(path.join(tmp(), 't.db')), (ch, p) => { if (ch === 'agent:event') events.push(p as AgentEvent) },
+      () => ({ node: '/bin/node', script: '/app/mcp.js', url: 'http://127.0.0.1:1', token: 'tok', env: { ELECTRON_RUN_AS_NODE: '1' } }))
     const { dir } = repo()
     const p = await svc.addProject(dir)
-    svc.updateProject(p.id, { account: 'dir:work' })
-    const a = await svc.assistantSend(p.id, 'Create task fix week start, urgent')
-    expect(a.tools).toEqual(['create_task(title: "Fix week start", priority: high)'])
-    expect(a.open).toMatchObject({ kind: 'task' })
-    expect(svc.listTasks(p.id)[0]).toMatchObject({ title: 'Fix week start', priority: 'high', description: 'from assistant' })
-    await svc.assistantSend(p.id, 'Note: Supabase — keep tokens server-side')
-    expect(svc.listNotes(p.id)[0]).toMatchObject({ title: 'Supabase', body: '- keep tokens server-side' })
-    const l = await svc.assistantSend(p.id, 'what is open')
-    expect(l.text).toContain('1 open: **Fix week start**')
+    const g = await svc.createGhost(p.id)
+    await svc.send(g.id, 'hi', [])
+    await new Promise<void>((r) => { const t = () => (events.some((e) => e.kind === 'done') ? r() : setTimeout(t, 50)); t() })
     const call = readLog()[0]
-    expect(call).toMatchObject({ mode: 'assistant', config: path.join(home, '.claude-work'), model: 'haiku', tools: '' })
-    expect(svc.assistantHistory(p.id).map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user', 'assistant'])
+    expect(call.allowed).toBe('mcp__bridge')
+    expect(call.hint).toMatch(/mcp__bridge__\* tools manage this project/)
+    expect(JSON.parse(call.mcp)).toEqual({ mcpServers: { bridge: { type: 'stdio', command: '/bin/node', args: ['/app/mcp.js'],
+      env: { ELECTRON_RUN_AS_NODE: '1', BRIDGE_API: 'http://127.0.0.1:1', BRIDGE_TOKEN: 'tok', BRIDGE_PROJECT: p.id } } } })
   })
 
-  it('the assistant falls back to the offline parser when the CLI fails', async () => {
-    const broken = path.join(tmp(), 'broken.cjs')
-    fs.writeFileSync(broken, 'process.exit(3)')
-    process.env.BRIDGE_CLAUDE_BIN = broken
-    const { svc } = setup()
+  it('instructions: project ones for every fork unless switched off there, plus the fork’s own, sent to the agent', async () => {
+    const { svc, done } = setup()
     const { dir } = repo()
     const p = await svc.addProject(dir)
-    await svc.assistantSend(p.id, 'Создай задачу проверить офлайн, срочно')
-    expect(svc.listTasks(p.id)[0]).toMatchObject({ title: 'Проверить офлайн', priority: 'high' })
-    const r = await svc.assistantSend(p.id, 'hello')
-    expect(r.text).toMatch(/I can add tasks and notes/)
+    const rspec = svc.createInstruction(p.id, { title: 'Tests', body: 'Use RSpec, not Minitest.' })
+    const lang = svc.createInstruction(p.id, { title: 'Language', body: 'Answer in Russian.' })
+    svc.createInstruction(p.id, {}) // empty ones are skipped
+    const a = await svc.createFork(p.id, { title: 'a', branch: 'agent/a', newBranch: true })
+    const b = await svc.createGhost(p.id)
+    svc.createInstruction(p.id, { forkId: a.id, title: 'Scope', body: 'Only touch app/models.' })
+    svc.setInstructionOn(a.id, lang.id, false)
+    expect(svc.instructionsFor(a.id)).toBe("The user's standing instructions for this project. Follow them in everything you do here, unless the user says otherwise in the chat.\n\n## Tests\n\nUse RSpec, not Minitest.\n\n## Scope\n\nOnly touch app/models.")
+    expect(svc.instructionsFor(b.id)).toContain('## Language')
+    expect(svc.instructionsFor(b.id)).not.toContain('Scope')
+    expect(svc.listForkInstructions(b.id)).toEqual([])
+    expect(svc.listInstructions(p.id).map((i) => i.title)).toEqual(['Tests', 'Language', ''])
+    // the run gets them as the appended system prompt
+    await svc.send(a.id, 'go', [])
+    await done(a.id)
+    expect(readLog()[0].hint).toContain('Use RSpec, not Minitest.')
+    expect(readLog()[0].hint).not.toContain('Russian')
+    svc.setInstructionOn(a.id, lang.id, true)
+    svc.updateInstruction(rspec.id, { body: 'Use RSpec 3.' })
+    expect(svc.instructionsFor(a.id)).toContain('Use RSpec 3.\n\n## Language')
+    svc.removeInstruction(rspec.id)
+    expect(svc.instructionsFor(a.id)).not.toContain('RSpec')
+    expect(() => svc.createInstruction(p.id, { forkId: 'nope' })).toThrow('Fork not found')
+  })
+
+  it('the done notice names the fork and quotes the reply; unseen forks are counted', async () => {
+    const db = openDb(path.join(tmp(), 'n.db'))
+    const events: AgentEvent[] = []
+    const svc = createService(db, (ch, p) => { if (ch === 'agent:event') events.push(p as AgentEvent) })
+    const { dir } = repo()
+    const p = await svc.addProject(dir)
+    const f = await svc.createFork(p.id, { title: 'Export', branch: 'agent/e', newBranch: true })
+    const g = await svc.createGhost(p.id, { title: 'Header' })
+    expect(unseenCount(db)).toBe(0)
+    await svc.send(f.id, 'go', [])
+    await new Promise<void>((r) => { const t = () => (events.some((e) => e.kind === 'done') ? r() : setTimeout(t, 50)); t() })
+    expect(doneNotice(db, f.id)).toEqual({ title: `Fork “Export” · ${p.name}`, body: 'Done. I wrote AGENT_WORK.md and updated README.md.', projectId: p.id })
+    expect(doneNotice(db, g.id, 'Simulated failure\nstack')).toMatchObject({ title: `Ghost “Header” · ${p.name}`, body: 'Failed: Simulated failure' })
+    expect(doneNotice(db, g.id)!.body).toBe('The agent finished.')
+    expect(doneNotice(db, 'nope')).toBeNull()
+    expect(unseenCount(db)).toBe(1)
+    svc.markSeen(f.id)
+    expect(unseenCount(db)).toBe(0)
+  })
+
+  it('Bridge tools create and change tasks and notes of one project over the local API', async () => {
+    const db = openDb(path.join(tmp(), 'a.db'))
+    const changed: string[] = []
+    const api = await startBridgeApi(db, (pid) => changed.push(pid))
+    db.addProject({ id: 'p', name: 'p', path: '/p', short: 'P', color: '#000', account: null })
+    db.addProject({ id: 'q', name: 'q', path: '/q', short: 'Q', color: '#000', account: null })
+    const call = async (name: string, args: object, token = api.token, projectId = 'p') =>
+      (await fetch(`${api.url}/tool`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ projectId, name, args }) })).json()
+    expect(await call('create_task', { title: 'Add import', priority: 'high' })).toEqual({ ok: true, text: 'Created task #1 “Add import” (high).' })
+    expect(await call('update_task', { id: 1, status: 'done' })).toMatchObject({ ok: true })
+    expect(db.getTask(1)).toMatchObject({ status: 'done', priority: 'high' })
+    expect((await call('list_tasks', {})).text).toBe('No tasks.')
+    expect((await call('list_tasks', { status: 'all' })).text).toBe('#1 [done] (high) Add import')
+    expect(await call('create_note', { title: 'Decision', body: 'Use SQLite' })).toMatchObject({ ok: true, text: 'Saved note #1 “Decision”.' })
+    await call('update_note', { id: 1, append: '- and WAL' })
+    expect(db.getNote(1)!.body).toBe('Use SQLite\n\n- and WAL')
+    expect((await call('list_notes', { id: 1 })).text).toBe('# Decision\n\nUse SQLite\n\n- and WAL')
+    // another project's items and bad input are refused
+    expect(await call('update_task', { id: 1, status: 'open' }, api.token, 'q')).toEqual({ ok: false, error: 'No task 1 in this project. Call list_tasks for ids.' })
+    expect(await call('create_task', {})).toEqual({ ok: false, error: 'title is required' })
+    expect(await call('drop_table', {})).toEqual({ ok: false, error: 'Unknown tool drop_table' })
+    expect((await fetch(`${api.url}/tool`, { method: 'POST', headers: { authorization: 'Bearer nope' }, body: '{}' })).status).toBe(401)
+    expect(changed).toEqual(['p', 'p', 'p', 'p'])
+    await api.close()
   })
 })

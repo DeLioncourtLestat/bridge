@@ -22,3 +22,21 @@ export function colorFor(name: string) {
 /** Git ref names we accept for new branches. */
 export const validBranch = (b: string) =>
   /^[\w][\w.\/-]*$/.test(b) && !b.includes('..') && !b.endsWith('/') && !b.endsWith('.lock') && !b.includes('//')
+
+/** Fuzzy score of `q` as a subsequence of `path`; null when it doesn't match. File name hits and runs score higher. */
+export function fuzzy(path: string, q: string): number | null {
+  if (!q) return 0
+  const p = path.toLowerCase()
+  const s = q.toLowerCase().replace(/\s+/g, '')
+  const base = p.lastIndexOf('/') + 1
+  let score = 0, at = -1, run = 0
+  for (const ch of s) {
+    const i = p.indexOf(ch, at + 1)
+    if (i < 0) return null
+    run = i === at + 1 ? run + 1 : 0
+    score += 1 + run * 2 + (i >= base ? 3 : 0) + (i === base || p[i - 1] === '/' || p[i - 1] === '-' || p[i - 1] === '_' || p[i - 1] === '.' ? 4 : 0)
+    at = i
+  }
+  if (p.slice(base).startsWith(s)) score += 20
+  return score - path.length * 0.01
+}

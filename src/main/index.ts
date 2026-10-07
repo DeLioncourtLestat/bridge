@@ -1,10 +1,13 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron'
-import { mkdirSync } from 'node:fs'
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell } from 'electron'
+import { appendFileSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { listAccounts } from './accounts'
 import { findClaude } from './agent'
 import { openDb } from './db'
 import { loadShellPath } from './env'
+import { COMMANDS, shortcut, type CommandId } from '../shared/keymap'
+import { startBridgeApi, type BridgeApi } from './bridgeApi'
+import { doneNotice, unseenCount } from './notify'
 import { createService, UserError } from './service'
 import { Terminals } from './terminals'
 
@@ -38,15 +41,19 @@ function createWindow() {
   win.on('closed', () => { win = null })
 }
 
-function buildMenu() {
+function buildMenu(keys: Record<string, string>) {
   const cmd = (name: string) => () => send('menu', name)
+  const item = (id: CommandId, label?: string): Electron.MenuItemConstructorOptions => ({
+    label: label ?? COMMANDS.find((c) => c.id === id)!.label, accelerator: shortcut(keys, id) || undefined, click: cmd(id),
+  })
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(process.platform === 'darwin'
-      ? [{ label: 'Bridge', submenu: [{ role: 'about' }, { type: 'separator' }, { label: 'Settings…', accelerator: 'Cmd+,', click: cmd('settings') }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }] } as Electron.MenuItemConstructorOptions]
+      ? [{ label: 'Bridge', submenu: [{ role: 'about' }, { type: 'separator' }, item('settings', 'Settings…'), { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' }, { type: 'separator' }, { role: 'quit' }] } as Electron.MenuItemConstructorOptions]
       : []),
-    { label: 'File', submenu: [{ label: 'Open Project…', accelerator: 'CmdOrCtrl+O', click: cmd('open-project') }, { label: 'New Fork…', accelerator: 'CmdOrCtrl+N', click: cmd('new-fork') }, { type: 'separator' }, process.platform === 'darwin' ? { role: 'close' } : { role: 'quit' }] },
+    { label: 'File', submenu: [item('open-project', 'Open Project…'), item('new-fork', 'New Fork or Ghost…'), ...(process.platform === 'darwin' ? [] : [item('settings', 'Settings…')]), { type: 'separator' }, process.platform === 'darwin' ? { role: 'close' } : { role: 'quit' }] },
     { role: 'editMenu' },
-    { label: 'View', submenu: [{ label: 'Tasks', accelerator: 'CmdOrCtrl+1', click: cmd('tasks') }, { label: 'Notes', accelerator: 'CmdOrCtrl+2', click: cmd('notes') }, { label: 'Assistant', accelerator: 'CmdOrCtrl+J', click: cmd('assistant') }, { type: 'separator' }, { role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
+    { label: 'Go', submenu: [item('go-to-file', 'Go to File…'), item('find-in-files', 'Find in Files…')] },
+    { label: 'View', submenu: [item('tasks', 'Tasks'), item('notes', 'Notes'), item('instructions', 'Instructions'), { type: 'separator' }, { role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { role: 'togglefullscreen' }] },
     { role: 'windowMenu' },
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
@@ -55,7 +62,33 @@ function buildMenu() {
 app.whenReady().then(async () => {
   mkdirSync(app.getPath('userData'), { recursive: true })
   const repo = openDb(path.join(app.getPath('userData'), 'bridge.db'))
-  const svc = createService(repo, send)
+  // the agent's tasks-and-notes tools call back into this process
+  let api: BridgeApi | null = null
+  // an agent finished: dock badge, and a notification when Bridge isn't in front
+  const badge = () => app.dock?.setBadge(unseenCount(repo) ? String(unseenCount(repo)) : '')
+  const emit = (channel: string, payload: any) => {
+    send(channel, payload)
+    if (channel !== 'agent:event' || payload.kind !== 'done') return
+    badge()
+    // tests set BRIDGE_NOTIFY_LOG: notices go to that file, whatever the focus, instead of the screen
+    const testLog = process.env.BRIDGE_NOTIFY_LOG
+    if (!repo.getSettings().notify || !win || (!testLog && (win.isFocused() || !Notification.isSupported()))) return
+    const n = doneNotice(repo, payload.forkId, payload.error)
+    if (!n) return
+    if (testLog) return appendFileSync(testLog, JSON.stringify({ ...n, forkId: payload.forkId }) + '\n')
+    const note = new Notification({ title: n.title, body: n.body })
+    note.on('click', () => {
+      // remember the fork as the project's open tab, then show it
+      repo.setKv(`ui:${n.projectId}`, { ...repo.getKv<Record<string, unknown>>(`ui:${n.projectId}`, {}), tab: payload.forkId })
+      if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus() }
+      send('open-fork', { projectId: n.projectId, forkId: payload.forkId })
+    })
+    note.show()
+  }
+  const svc = createService(repo, emit, () => api && {
+    node: process.execPath, script: path.join(__dirname, 'mcp.js'), url: api.url, token: api.token, env: { ELECTRON_RUN_AS_NODE: '1' },
+  })
+  api = await startBridgeApi(repo, (projectId) => send('data:changed', { projectId }))
   const terms = new Terminals(repo, send)
   loadShellPath()
 
@@ -64,7 +97,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('call', async (_e, method: string, args: unknown[]) => {
     if (!methods.has(method)) return { ok: false, error: `Unknown method ${method}` }
     try {
-      return { ok: true, value: await (svc as any)[method](...args) }
+      const value = await (svc as any)[method](...args)
+      if (method === 'setSettings') buildMenu(repo.getSettings().keys)
+      if (method === 'markSeen') badge()
+      return { ok: true, value }
     } catch (e) {
       return { ok: false, error: (e as Error).message, user: e instanceof UserError }
     }
@@ -76,6 +112,7 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('reveal', (_e, p: string) => shell.showItemInFolder(p))
   ipcMain.handle('cliInfo', () => ({ claude: findClaude() }))
+  ipcMain.handle('menu:suspend', (_e, on: boolean) => buildMenu(on ? Object.fromEntries(COMMANDS.map((c) => [c.id, ''])) : repo.getSettings().keys))
 
   // terminals
   ipcMain.handle('term:list', (_e, forkId: string) => repo.listTerminals(forkId))
@@ -106,7 +143,7 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('account:loginClose', (_e, id: string) => terms.kill(id))
 
-  buildMenu()
+  buildMenu(repo.getSettings().keys)
   createWindow()
 
   app.on('activate', () => { if (!BrowserWindow.getAllWindows().length) createWindow() })

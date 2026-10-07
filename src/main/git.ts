@@ -119,6 +119,42 @@ export function safePath(cwd: string, file: string) {
   return full
 }
 
+export type GrepHit = { file: string; line: number; text: string }
+
+/** Search tracked and untracked (not ignored) text files. Plain text unless `regex` (Perl syntax, or extended
+ *  POSIX where git lacks PCRE); case-insensitive unless `caseSensitive`. */
+export async function grep(cwd: string, query: string, opts: { caseSensitive?: boolean; regex?: boolean } = {}, limit = 500) {
+  if (!opts.regex) return grepWith(cwd, query, '-F', opts.caseSensitive, limit)
+  try {
+    return await grepWith(cwd, query, '-P', opts.caseSensitive, limit)
+  } catch (e) {
+    if (/pcre|not built|unsupported|support for perl/i.test((e as Error).message)) return grepWith(cwd, query, '-E', opts.caseSensitive, limit)
+    throw e
+  }
+}
+
+function grepWith(cwd: string, query: string, mode: string, caseSensitive: boolean | undefined, limit: number): Promise<{ hits: GrepHit[]; truncated: boolean }> {
+  const args = ['grep', '-n', '-I', '--untracked', '--no-color', '--null', mode]
+  if (!caseSensitive) args.push('-i')
+  args.push('-e', query, '--')
+  return new Promise((resolve, reject) => {
+    execFile('git', args, { cwd, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' } }, (err, stdout, stderr) => {
+      // exit code 1 just means "no matches"
+      if (err && (err as { code?: number }).code !== 1) return reject(new GitError((stderr || err.message).trim().replace(/^fatal:\s*/, '')))
+      const hits: GrepHit[] = []
+      const lines = stdout.split('\n')
+      for (const l of lines) {
+        if (hits.length >= limit) break
+        const [file, num, ...rest] = l.split('\0')
+        if (!file || !num) continue
+        const text = rest.join('\0')
+        hits.push({ file, line: Number(num), text: text.length > 300 ? text.slice(0, 300) + '…' : text })
+      }
+      resolve({ hits, truncated: lines.filter(Boolean).length > hits.length })
+    })
+  })
+}
+
 export async function readFile(cwd: string, file: string): Promise<string | null> {
   try {
     return await fs.readFile(safePath(cwd, file), 'utf8')

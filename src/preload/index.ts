@@ -24,6 +24,8 @@ const api = {
   pickFolder: (): Promise<string | null> => ipcRenderer.invoke('pickFolder'),
   reveal: (p: string) => ipcRenderer.invoke('reveal', p),
   cliInfo: (): Promise<{ claude: string | null }> => ipcRenderer.invoke('cliInfo'),
+  /** Drop the app's shortcuts from the menu while Settings records a new one, so the key press reaches the page. */
+  suspendShortcuts: (on: boolean) => ipcRenderer.invoke('menu:suspend', on),
   term: {
     list: (forkId: string) => ipcRenderer.invoke('term:list', forkId),
     create: (forkId: string): Promise<string> => ipcRenderer.invoke('term:create', forkId),

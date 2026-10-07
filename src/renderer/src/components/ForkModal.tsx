@@ -2,14 +2,14 @@ import { useEffect, useMemo, useState } from 'react'
 import type { Account, Fork, Project, Settings } from '../../../shared/types'
 import { slug, validBranch } from '../../../shared/util'
 import { svc } from '../api'
-import { Overlay } from '../ui'
+import { Icon, Overlay } from '../ui'
 import { accountLabel, resolveAccount } from './AccountMenu'
 
 type Props = { project: Project; forks: Fork[]; accounts: Account[]; settings: Settings; onClose: () => void; onOpened: (f: Fork) => void }
 
 export function ForkModal({ project, forks, accounts, settings, onClose, onOpened }: Props) {
   const closed = forks.filter((f) => !f.open)
-  const [mode, setMode] = useState<'new' | 'open'>('new')
+  const [mode, setMode] = useState<'new' | 'ghost' | 'open'>('new')
   const [bmode, setBmode] = useState<'new' | 'existing'>('new')
   const [name, setName] = useState('')
   const [branch, setBranch] = useState('')
@@ -25,9 +25,16 @@ export function ForkModal({ project, forks, accounts, settings, onClose, onOpene
   const parent = project.path.replace(/\/[^/]+$/, '')
   const folder = useMemo(() => `${parent}/${project.name}_worktrees/${(target || '…').split('/').pop()}`, [parent, project.name, target])
   const acc = resolveAccount(accounts, project.account, settings.defaultAccount)
+  const current = branches.find((b) => b.usedBy === 'checked out in the project folder')?.name
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (mode === 'ghost') {
+      setBusy(true)
+      setErr('')
+      try { onOpened(await svc.createGhost(project.id, { title: name })) } catch (x) { setErr((x as Error).message); setBusy(false) }
+      return
+    }
     if (mode !== 'new') return
     if (!target) return setErr('Pick a branch.')
     if (bmode === 'new') {
@@ -51,9 +58,19 @@ export function ForkModal({ project, forks, accounts, settings, onClose, onOpene
         <h2>Fork</h2>
         <div className="seg">
           <button type="button" data-mode="new" aria-pressed={mode === 'new'} onClick={() => { setMode('new'); setErr('') }}>New fork</button>
+          <button type="button" data-mode="ghost" aria-pressed={mode === 'ghost'} onClick={() => { setMode('ghost'); setErr('') }}>Ghost</button>
           <button type="button" data-mode="open" aria-pressed={mode === 'open'} onClick={() => { setMode('open'); setErr('') }}>Open existing{closed.length ? ` (${closed.length})` : ''}</button>
         </div>
-        {mode === 'new' ? (
+        {mode === 'ghost' ? (
+          <>
+            <label>Ghost name<input className="inp" id="gName" autoFocus placeholder="e.g. Fix the header" value={name} onChange={(e) => setName(e.target.value)} /></label>
+            <p className="ctext ghostnote">A ghost works right in the project folder, on the branch checked out there{current ? <> (<span className="mono">{current}</span>)</> : ''}. No worktree, no new branch. Open several ghosts and they all work on the same files, side by side with you.</p>
+            <div className="h">Agent: {acc ? accountLabel(acc) : 'no account'} (project account)</div>
+            <div className="h">Folder: <span className="mono">{project.path}</span></div>
+            {err && <div className="ferr">{err}</div>}
+            <div className="mact"><span className="sp" /><button type="button" className="btn" onClick={onClose}>Cancel</button><button type="submit" className="btn pri" id="gCreate" disabled={busy}>{busy ? 'Creating…' : 'Create ghost'}</button></div>
+          </>
+        ) : mode === 'new' ? (
           <>
             <label>Fork name<input className="inp" id="fName" autoFocus placeholder="e.g. Recurring events" value={name} onChange={(e) => setName(e.target.value)} /></label>
             <label>Branch
@@ -86,7 +103,7 @@ export function ForkModal({ project, forks, accounts, settings, onClose, onOpene
             <div className="blist">
               {closed.length ? closed.map((f) => (
                 <button type="button" key={f.id} className="bi open" data-reopen={f.id} onClick={async () => { onOpened(await svc.setForkOpen(f.id, true)) }}>
-                  <span>{f.title}</span><span className="mono h">{f.branch}</span>
+                  <span>{f.ghost && <span className="ghi">{Icon.ghost}</span>}{f.title}</span><span className="mono h">{f.ghost ? 'project folder' : f.branch}</span>
                 </button>
               )) : <div className="hint" style={{ padding: '8px 10px' }}>All forks are already open.</div>}
             </div>

@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { Account, ChatMessage, Fork, Note, Ref, Task } from '../shared/types'
+import { bridgeToolSummary } from './bridgeTools'
 import { childEnv, home } from './env'
 
 /** Locate the Claude Code CLI. Tests set BRIDGE_CLAUDE_BIN to a fake. */
@@ -37,7 +38,7 @@ export function toolSummary(name: string, input: any, cwd: string): string {
     case 'TodoWrite': return 'Updated the plan'
     case 'WebFetch': return `Fetched ${input?.url ?? ''}`
     case 'WebSearch': return `Searched the web for “${cut(String(input?.query ?? ''), 40)}”`
-    default: return name
+    default: return name.startsWith('mcp__bridge__') ? bridgeToolSummary(name.slice(13), input) : name
   }
 }
 
@@ -67,14 +68,29 @@ export function parseStreamLine(line: string): StreamEvent[] {
   return []
 }
 
+/** Tells the agent the Bridge tools exist and when to reach for them. */
+export const BRIDGE_HINT =
+  'You run inside Bridge, the user\'s project manager. The mcp__bridge__* tools manage this project\'s task list and notes in Bridge. ' +
+  'When the user asks to add, change, finish or list tasks, or to write down, save or update a note, use those tools (not files in the repo). ' +
+  'You may also mark the attached task done with update_task when you have finished it.'
+
+/** One --append-system-prompt: the Bridge tools hint (when the tools are there) and the instructions. */
+function appendPrompt(opts: { mcpConfig?: string | null; instructions?: string }) {
+  const text = [opts.mcpConfig ? BRIDGE_HINT : '', opts.instructions ?? ''].filter(Boolean).join('\n\n')
+  return text ? ['--append-system-prompt', text] : []
+}
+
 /** The prompt sent to the agent: what the user wrote plus attached tasks and notes. */
-export function buildPrompt(text: string, tasks: Task[], notes: Note[]) {
+export function buildPrompt(text: string, tasks: Task[], notes: Note[], ghost = false) {
   const blocks: string[] = []
   for (const t of tasks)
     blocks.push(`Task: ${t.title}\nPriority: ${t.priority}. Status: ${t.status}.${t.description ? `\n${t.description}` : ''}`)
   for (const n of notes) blocks.push(`Note: ${n.title}\n${n.body}`)
   const ctx = blocks.length ? `Context from the project:\n\n${blocks.join('\n\n---\n\n')}\n\n` : ''
-  return `${ctx}${text.trim() || 'Work on the attached task.'}`
+  const shared = ghost
+    ? 'Note: you work directly in the main project folder. Other agents may be editing files here at the same time. Do not revert, reformat or stash changes you did not make, and do not switch branches.\n\n'
+    : ''
+  return `${shared}${ctx}${text.trim() || 'Work on the attached task.'}`
 }
 
 type RunOptions = {
@@ -82,7 +98,11 @@ type RunOptions = {
   account: Account | null
   prompt: string
   permissionMode: string
-  onUpdate: (text: string, tools: string[]) => void
+  /** `--mcp-config` JSON that gives the agent Bridge's task and note tools. */
+  mcpConfig?: string | null
+  /** The project's and fork's instructions, appended to the system prompt. */
+  instructions?: string
+  onUpdate: (text: string, tools: string[], marks: number[]) => void
   onSession: () => void
 }
 
@@ -108,12 +128,15 @@ export class AgentRunner {
       '-p', opts.prompt,
       '--output-format', 'stream-json', '--verbose',
       '--permission-mode', opts.permissionMode,
+      ...(opts.mcpConfig ? ['--mcp-config', opts.mcpConfig, '--allowedTools', 'mcp__bridge'] : []),
+      ...appendPrompt(opts),
       ...(fork.sessionStarted ? ['--resume', fork.sessionId] : ['--session-id', fork.sessionId]),
     ]
     const child = spawnCli(bin, args, fork.path, opts.account)
     this.procs.set(fork.id, child)
     let text = ''
     const tools: string[] = []
+    const marks: number[] = []
     let result: { isError: boolean; text: string } | null = null
     let stderr = ''
     let buf = ''
@@ -121,9 +144,12 @@ export class AgentRunner {
       for (const ev of parseStreamLine(line)) {
         if (ev.kind === 'session') opts.onSession()
         else if (ev.kind === 'text') text += (text ? '\n\n' : '') + ev.text
-        else if (ev.kind === 'tool') tools.push(toolSummary(ev.name, ev.input, fork.path))
+        else if (ev.kind === 'tool') {
+          tools.push(toolSummary(ev.name, ev.input, fork.path))
+          marks.push(text.length)
+        }
         else result = ev
-        if (ev.kind !== 'session') opts.onUpdate(text, tools)
+        if (ev.kind !== 'session') opts.onUpdate(text, tools, marks)
       }
     }
     child.stdout?.on('data', (d: Buffer) => {
@@ -142,7 +168,7 @@ export class AgentRunner {
         const r = result as { isError: boolean; text: string } | null
         if (r && !r.isError && !text && r.text) {
           text = r.text
-          opts.onUpdate(text, tools)
+          opts.onUpdate(text, tools, marks)
         }
         if (err) resolve({ ok: false, error: err.message })
         else if (r?.isError) resolve({ ok: false, error: r.text || 'The agent reported an error' })

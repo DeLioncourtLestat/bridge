@@ -2,8 +2,17 @@ import { useEffect, useRef } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import { bridge } from '../api'
+import { currentTheme, THEME_EVENT } from '../settings'
 
-const THEME = { background: '#0a0a0a', foreground: '#e5e5e5', cursor: '#f5f5f5', selectionBackground: '#3b82f655', black: '#262626', brightBlack: '#525252' }
+const THEMES = {
+  dark: { background: '#0a0a0a', foreground: '#e5e5e5', cursor: '#f5f5f5', cursorAccent: '#0a0a0a', selectionBackground: '#3b82f655', black: '#262626', brightBlack: '#525252' },
+  light: {
+    background: '#ffffff', foreground: '#27272a', cursor: '#18181b', cursorAccent: '#ffffff', selectionBackground: '#3b82f640',
+    black: '#27272a', brightBlack: '#71717a', white: '#a1a1aa', brightWhite: '#d4d4d8',
+    red: '#c41a16', green: '#007400', yellow: '#946800', blue: '#0451a5', magenta: '#a626a4', cyan: '#0e7490',
+    brightRed: '#dc2626', brightGreen: '#16a34a', brightYellow: '#a16207', brightBlue: '#2563eb', brightMagenta: '#c026d3', brightCyan: '#0891b2',
+  },
+}
 
 type Attach = (cols: number, rows: number) => Promise<{ id: string; buffer: string } | null>
 
@@ -21,7 +30,7 @@ export function Xterm({ attach }: { attach: Attach }) {
       fontSize: 13,
       lineHeight: 1.25,
       cursorBlink: true,
-      theme: THEME,
+      theme: THEMES[currentTheme()],
       scrollback: 5000,
     })
     const fit = new FitAddon()
@@ -39,12 +48,14 @@ export function Xterm({ attach }: { attach: Attach }) {
       if (r.buffer) term.write(r.buffer)
       term.focus()
     })
+    const retheme = () => { term.options.theme = THEMES[currentTheme()] }
+    window.addEventListener(THEME_EVENT, retheme)
     const input = term.onData((d) => { if (id) bridge().term.write(id, d) })
     const ro = new ResizeObserver(() => {
       try { fit.fit(); if (id) bridge().term.resize(id, term.cols, term.rows) } catch { /* hidden */ }
     })
     ro.observe(host.current!)
-    return () => { alive = false; off(); offExit(); input.dispose(); ro.disconnect(); term.dispose() }
+    return () => { alive = false; window.removeEventListener(THEME_EVENT, retheme); off(); offExit(); input.dispose(); ro.disconnect(); term.dispose() }
   }, [])
   return <div className="xhost" ref={host} />
 }
