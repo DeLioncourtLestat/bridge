@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
-import { esc } from '../../shared/util'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { highlightLines } from './syntax'
 import type { DiffOp } from '../../shared/types'
 
 /* ---------- icons ---------- */
@@ -11,32 +11,27 @@ export const Icon = {
   term: svg(<><rect x="2" y="3" width="12" height="10" rx="1" /><path d="M4.5 6.5 6.5 8l-2 1.5M8 10h3.5" /></>),
   git: svg(<><circle cx="4.5" cy="3.5" r="1.5" /><circle cx="4.5" cy="12.5" r="1.5" /><circle cx="11.5" cy="5.5" r="1.5" /><path d="M4.5 5v6M11.5 7c0 3-7 2-7 4" /></>),
   gear: svg(<><circle cx="8" cy="8" r="2.2" /><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1" /></>),
-  spark: svg(<><path d="M8 2.2l1.3 3.2 3.2 1.3-3.2 1.3L8 11.2 6.7 8 3.5 6.7l3.2-1.3z" /><path d="M12.5 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z" /></>),
+  instr: svg(<><path d="M4 2.5h6.5L13 5v8.5H4z" /><path d="M10.5 2.5V5H13M6.2 8h4.6M6.2 10.5h3" /></>),
+  check: svg(<path d="M3.5 8.5l3 3 6-6.5" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />),
+  ghost: svg(<><path d="M3.5 14V7a4.5 4.5 0 0 1 9 0v7l-1.5-1.2L9.5 14 8 12.8 6.5 14 5 12.8z" /><path d="M6.3 7h.01M9.7 7h.01" /></>),
   user: svg(<><circle cx="8" cy="5.5" r="2.5" /><path d="M3 13.5c.8-2.4 2.7-3.6 5-3.6s4.2 1.2 5 3.6" /></>),
 }
 
-/* ---------- light syntax highlight for diffs ---------- */
-export function hl(src: string) {
-  const re = /(\/\/.*$|#.*$|--.*$|\/\*.*?\*\/)|('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`[^`]*`)|\b(import|from|export|const|let|var|function|return|if|else|for|while|await|async|default|throw|new|type|interface|class|extends|package|func|def|struct)\b|\b(\d+)\b/g
-  let out = ''
-  let last = 0
-  let m: RegExpExecArray | null
-  while ((m = re.exec(src))) {
-    out += esc(src.slice(last, m.index))
-    out += `<span class="tk-${m[1] ? 'c' : m[2] ? 's' : m[3] ? 'k' : 'n'}">${esc(m[0])}</span>`
-    last = re.lastIndex
-  }
-  return out + esc(src.slice(last))
-}
-
-export function DiffView({ ops }: { ops: DiffOp[] }) {
+/** A diff with both sides highlighted as whole files, so multi-line strings and comments color right. */
+export function DiffView({ ops, path }: { ops: DiffOp[]; path: string }) {
+  const html = useMemo(() => {
+    const oldSide = highlightLines(path, ops.filter((o) => o.t !== '+').map((o) => o.s))
+    const newSide = highlightLines(path, ops.filter((o) => o.t !== '-').map((o) => o.s))
+    let a = 0, b = 0
+    return ops.map((o) => (o.t === '-' ? oldSide[a++] : o.t === '+' ? newSide[b++] : (a++, newSide[b++])))
+  }, [ops, path])
   return (
     <div className="code">
       {ops.map((o, i) => (
         <div key={i} className={`dl ${o.t === '+' ? 'add' : o.t === '-' ? 'del' : ''}`}>
           <span className="ln">{o.t === '-' ? o.a : o.b}</span>
           <span className="mk">{o.t === ' ' ? '' : o.t === '+' ? '+' : '−'}</span>
-          <span className="tx" dangerouslySetInnerHTML={{ __html: hl(o.s) || ' ' }} />
+          <span className="tx" dangerouslySetInnerHTML={{ __html: html[i] || ' ' }} />
         </div>
       ))}
     </div>

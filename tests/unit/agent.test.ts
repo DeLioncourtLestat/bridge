@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import { buildPrompt, parseStreamLine, toolSummary } from '../../src/main/agent'
-import { extractJson } from '../../src/main/assistant'
 
 describe('agent stream', () => {
   it('parses init, text, tool calls and the result', () => {
@@ -26,10 +25,12 @@ describe('agent stream', () => {
     expect(p).toContain('Note: Decisions\nUse SQLite')
     expect(p.endsWith('Do it')).toBe(true)
     expect(buildPrompt('  ', [], [])).toBe('Work on the attached task.')
+    expect(buildPrompt('Go', [], [], true)).toMatch(/^Note: you work directly in the main project folder.*\n\nGo$/s)
   })
-  it('extracts JSON from fenced model output', () => {
-    expect(extractJson('```json\n{"a":1}\n```')).toEqual({ a: 1 })
-    expect(extractJson('sure! {"reply":"x","actions":[]} hope it helps')).toEqual({ reply: 'x', actions: [] })
-    expect(extractJson('no json')).toBeNull()
+  it('reads Bridge tool calls like the built-in ones', () => {
+    expect(toolSummary('mcp__bridge__create_task', { title: 'Add import' }, '/w')).toBe('Created task “Add import”')
+    expect(toolSummary('mcp__bridge__update_task', { id: 4, status: 'done' }, '/w')).toBe('Completed task #4')
+    expect(toolSummary('mcp__bridge__create_note', { title: 'Decision' }, '/w')).toBe('Saved note “Decision”')
+    expect(toolSummary('mcp__other__x', {}, '/w')).toBe('mcp__other__x')
   })
 })

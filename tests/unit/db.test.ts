@@ -31,7 +31,7 @@ describe('database', () => {
     expect(db.getNote(n.id)!.body).toBe('changed')
   })
 
-  it('keeps forks, chat messages, terminals and the assistant log', () => {
+  it('keeps forks, chat messages and terminals', () => {
     const db = fresh()
     db.addFork({ id: 'f', projectId: 'p', title: 'F', branch: 'agent/f', path: '/w/f', open: true, sessionId: 's', sessionStarted: false, state: 'idle', autoNamed: false, autoBranch: false, createdAt: 1 })
     db.updateFork('f', { open: false, state: 'wait', sessionStarted: true })
@@ -49,8 +49,6 @@ describe('database', () => {
     expect(db.terminalBuffer('t1')).toHaveLength(200_000)
     db.removeTerminal('t2')
     expect(db.listTerminals('f')).toHaveLength(1)
-    db.addAssistant('p', 'assistant', 'ok', ['create_task()'], { kind: 'task', id: 3 })
-    expect(db.listAssistant('p')[0]).toMatchObject({ text: 'ok', tools: ['create_task()'], open: { kind: 'task', id: 3 } })
   })
 
   it('removing a project removes everything under it', () => {
@@ -79,5 +77,18 @@ describe('database', () => {
     a.createTask('p', { title: 'persist' })
     a.close()
     expect(openDb(file).listTasks('p')[0].title).toBe('persist')
+  })
+
+  it('moves the old 2px corners to the rounded default once, then keeps the choice', () => {
+    const file = path.join(tmp(), 'r.db')
+    const a = openDb(file)
+    a.raw.prepare("DELETE FROM kv WHERE key = 'ui.rounded'").run()
+    a.setKv('settings', { ...DEFAULT_SETTINGS, radius: 2 })
+    a.close()
+    const b = openDb(file)
+    expect(b.getSettings().radius).toBe(6)
+    b.setSettings({ radius: 2 })
+    b.close()
+    expect(openDb(file).getSettings().radius).toBe(2)
   })
 })

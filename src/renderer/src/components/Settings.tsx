@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Account, Project, Settings } from '../../../shared/types'
 import { bridge, svc } from '../api'
-import { ACCENTS, CODE_FONTS, CODE_SIZES, UI_FONTS } from '../settings'
+import { COMMANDS, formatShortcut, shortcut, shortcutFromEvent, type CommandId } from '../../../shared/keymap'
+import { ACCENTS, CODE_FONTS, CODE_SIZES, keyRecording, UI_FONTS } from '../settings'
+import { highlightLines } from '../syntax'
 import { Overlay, useUi } from '../ui'
 import { resolveAccount } from './AccountMenu'
 import { Xterm } from './Xterm'
 
-type Section = 'agents' | 'appearance' | 'editor' | 'terminal'
-const SECTIONS: [Section, string][] = [['agents', 'Agents & accounts'], ['appearance', 'Appearance'], ['editor', 'Editor'], ['terminal', 'Terminal']]
+type Section = 'agents' | 'appearance' | 'editor' | 'keymap' | 'terminal'
+const SECTIONS: [Section, string][] = [['agents', 'Agents & accounts'], ['appearance', 'Appearance'], ['editor', 'Editor'], ['keymap', 'Keymap'], ['terminal', 'Terminal']]
 
 type Props = {
   settings: Settings; accounts: Account[]; projects: Project[]; project: Project | null
@@ -53,7 +55,7 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
     if (sec === 'agents') return (
       <>
         <div><h3>Agents & accounts</h3><p className="lead">Each Claude account is its own config folder. Projects use the default account unless you pick another one with the account button next to Settings.</p></div>
-        {cli === null && <div className="cli-missing">Claude Code CLI wasn’t found in ~/.local/bin, /opt/homebrew/bin or /usr/local/bin. Install it to run agents; the assistant still works offline for simple requests.</div>}
+        {cli === null && <div className="cli-missing">Claude Code CLI wasn’t found in ~/.local/bin, /opt/homebrew/bin or /usr/local/bin. Install it to run agents in forks and ghosts.</div>}
         <div className="sgroup"><h4>Claude accounts</h4>
           {accounts.map((a) => {
             const used = usedBy(a)
@@ -89,7 +91,8 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
         </div>
         <div className="sgroup"><h4>Agent</h4>
           {select('permissionMode', 'Permissions', [['acceptEdits', 'Accept edits (asks before commands)'], ['auto', 'Auto'], ['bypassPermissions', 'Bypass all checks']], 'How freely the agent may act inside its fork')}
-          <div className="srow"><div><div className="k">Claude Code CLI</div><div className="h">Used for forks and the assistant</div></div><span className="mono pathval">{cli === undefined ? '…' : cli ?? 'not found'}</span></div>
+          <div className="srow"><div><div className="k">Claude Code CLI</div><div className="h">Used for forks and ghosts</div></div><span className="mono pathval">{cli === undefined ? '…' : cli ?? 'not found'}</span></div>
+          {tog('notify', 'Notify when an agent finishes', 'A system notification when Bridge isn’t in front; click it to open that fork')}
           {project && <div className="srow"><div><div className="k">Fork folders</div><div className="h">A sibling folder next to the project; one subfolder per fork</div></div><span className="mono pathval" title={`${project.path.replace(/\/[^/]+$/, '')}/${project.name}_worktrees/`}>{project.path.replace(/\/[^/]+$/, '')}/{project.name}_worktrees/</span></div>}
         </div>
       </>
@@ -98,10 +101,12 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
       <>
         <div><h3>Appearance</h3><p className="lead">Changes apply right away.</p></div>
         <div className="sgroup"><h4>Theme</h4>
+          <div className="srow"><div><div className="k">Color theme</div><div className="h">System follows your OS setting</div></div>
+            <div className="seg">{([['dark', 'Dark'], ['light', 'Light'], ['system', 'System']] as const).map(([v, l]) => <button key={v} data-theme-opt={v} aria-pressed={st.theme === v} onClick={() => set({ theme: v })}>{l}</button>)}</div></div>
           <div className="srow"><div><div className="k">Accent color</div><div className="h">Selection, active items, task chips</div></div>
             <div className="swatches">{Object.entries(ACCENTS).map(([n, [c]]) => <button key={n} className="sw" style={{ background: c }} aria-pressed={st.accent === n} data-accent={n} title={n} aria-label={n} onClick={() => set({ accent: n })} />)}</div></div>
           <div className="srow"><div><div className="k">Corners</div></div>
-            <div className="seg">{([[0, 'Square'], [2, 'Sharp'], [6, 'Soft']] as const).map(([v, l]) => <button key={v} data-radius={v} aria-pressed={st.radius === v} onClick={() => set({ radius: v })}>{l}</button>)}</div></div>
+            <div className="seg">{([[2, 'Sharp'], [6, 'Soft'], [10, 'Round']] as const).map(([v, l]) => <button key={v} data-radius={v} aria-pressed={st.radius === v} onClick={() => set({ radius: v })}>{l}</button>)}</div></div>
           {tog('compact', 'Compact density', 'Tighter rows in lists and chat')}
         </div>
         <div className="sgroup"><h4>Fonts</h4>
@@ -115,7 +120,12 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
     )
     if (sec === 'editor') return (
       <>
-        <div><h3>Editor</h3><p className="lead">The Explorer inside forks.</p></div>
+        <div><h3>Editor</h3><p className="lead">The Explorer inside forks, diffs, search previews and code in chat.</p></div>
+        <div className="sgroup"><h4>Code colors</h4>
+          <div className="srow"><div><div className="k">Color scheme</div><div className="h">Functions, variables, properties, types, strings and comments each get their own color</div></div>
+            <div className="seg">{([['vscode', 'VS Code'], ['jetbrains', 'JetBrains']] as const).map(([v, l]) => <button key={v} data-syntax-opt={v} aria-pressed={(st.syntax || 'vscode') === v} onClick={() => set({ syntax: v })}>{l}</button>)}</div></div>
+          <div className="preview code synprev" dangerouslySetInnerHTML={{ __html: SAMPLE }} />
+        </div>
         <div className="sgroup">
           {tog('lineNumbers', 'Line numbers')}
           {tog('highlightChanges', 'Highlight changed lines', 'Green background and a bar next to lines that differ from the last commit')}
@@ -123,6 +133,7 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
         </div>
       </>
     )
+    if (sec === 'keymap') return <Keymap keys={st.keys ?? {}} onChange={(keys) => set({ keys })} />
     return (
       <>
         <div><h3>Terminal</h3><p className="lead">Terminals open in the fork’s worktree folder. Changes apply to new terminals.</p></div>
@@ -140,7 +151,7 @@ export function SettingsModal({ settings: st, accounts, projects, project, onSet
             <span style={{ flex: 1 }} />
             <button id="sReset" style={{ color: 'var(--faint)', fontSize: 12.5 }} onClick={async () => {
               if (await confirm({ title: 'Reset appearance?', text: 'Colors, fonts, editor and terminal settings go back to defaults. Accounts stay.', ok: 'Reset' }))
-                set({ accent: 'Blue', radius: 2, compact: false, uiFont: 'System', uiSize: 14, codeFont: 'System mono', codeSize: 12.5, lineNumbers: true, highlightChanges: true, tabSize: 2 })
+                set({ theme: 'dark', accent: 'Blue', radius: 6, compact: false, uiFont: 'System', uiSize: 14, codeFont: 'System mono', codeSize: 12.5, lineNumbers: true, highlightChanges: true, tabSize: 2 })
             }}>Reset to defaults</button>
           </nav>
           <div className="sbody">{body()}</div>
@@ -170,5 +181,72 @@ function LoginModal({ account, onClose }: { account: Account; onClose: () => voi
         )}
       </div>
     </div>
+  )
+}
+
+const mac = window.bridge.platform === 'darwin'
+
+const SAMPLE = highlightLines('sample.ts', [
+  '// Load the user and greet them',
+  'import { db } from "./db"',
+  '',
+  'export class Greeter {',
+  '  private count = 0',
+  '  async greet(id: number): Promise<string> {',
+  '    const user = await db.find(id)',
+  '    if (!user) return null',
+  '    this.count += 1',
+  '    return `Hello, ${user.name}`',
+  '  }',
+  '}',
+]).map((l, i) => `<div class="dl"><span class="ln">${i + 1}</span><span class="tx">${l || ' '}</span></div>`).join('')
+
+/** Shortcuts: click one, press the new keys. Backspace clears it, Escape keeps the old one. */
+function Keymap({ keys, onChange }: { keys: Record<string, string>; onChange: (k: Record<string, string>) => void }) {
+  const [rec, setRec] = useState<CommandId | null>(null)
+  useEffect(() => {
+    if (!rec) return
+    keyRecording.on = true
+    window.bridge.suspendShortcuts(true)
+    const h = (e: KeyboardEvent) => {
+      e.preventDefault()
+      e.stopImmediatePropagation()
+      const plain = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+      if (e.key === 'Escape' && plain) return setRec(null)
+      if ((e.key === 'Backspace' || e.key === 'Delete') && plain) { onChange({ ...keys, [rec]: '' }); return setRec(null) }
+      const acc = shortcutFromEvent(e, mac)
+      if (!acc) return
+      onChange({ ...keys, [rec]: acc })
+      setRec(null)
+    }
+    window.addEventListener('keydown', h, true)
+    return () => { window.removeEventListener('keydown', h, true); keyRecording.on = false; window.bridge.suspendShortcuts(false) }
+  }, [rec]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const used = (id: CommandId) => { const k = shortcut(keys, id); return k ? COMMANDS.filter((c) => c.id !== id && shortcut(keys, c.id) === k).map((c) => c.label) : [] }
+  const groups = [...new Set(COMMANDS.map((c) => c.group))]
+  return (
+    <>
+      <div><h3>Keymap</h3><p className="lead">Click a shortcut and press the new keys. Backspace removes it, Escape cancels.</p></div>
+      {groups.map((g) => (
+        <div className="sgroup" key={g}><h4>{g}</h4>
+          {COMMANDS.filter((c) => c.group === g).map((c) => {
+            const k = shortcut(keys, c.id)
+            const clash = used(c.id)
+            return (
+              <div className="srow" key={c.id}>
+                <div><div className="k">{c.label}</div>{clash.length > 0 && <div className="kwarn">Also used by {clash.join(', ')}</div>}</div>
+                <div className="krow">
+                  {c.id in keys && <button className="mini" title={`Reset to ${formatShortcut(c.def, mac)}`} aria-label={`Reset ${c.label}`} data-kreset={c.id} onClick={() => { const n = { ...keys }; delete n[c.id]; onChange(n) }}>↺</button>}
+                  <button className={`kbd${rec === c.id ? ' rec' : k ? '' : ' none'}`} data-key={c.id} onClick={() => setRec(rec === c.id ? null : c.id)}>
+                    {rec === c.id ? 'Press keys…' : k ? formatShortcut(k, mac) : 'None'}
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      ))}
+    </>
   )
 }

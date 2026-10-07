@@ -14,7 +14,7 @@ test('projects: open, initialise plain folder, switch, remember', async () => {
   await expect(ec).toHaveAttribute('aria-current', 'true')
 
   // tabs: Tasks and Notes first, no Code tab, + Fork at the end
-  await expect(page.locator('.tabs > *')).toHaveText(['Tasks 0', 'Notes 0', '+ Fork'])
+  await expect(page.locator('.tabs > *')).toHaveText(['Tasks 0', 'Notes 0', 'Instructions 0', '+ Fork'])
 
   // a plain folder asks to initialise git
   await stubFolder(app, sb.plainDir)
@@ -48,5 +48,44 @@ test('projects: open, initialise plain folder, switch, remember', async () => {
   ;({ app, page } = await launch(sb))
   await expect(page.locator('.pj').nth(2)).toHaveAttribute('aria-current', 'true')
   await expect(page.locator('.ti b')).toHaveText(['Shop task'])
+  await app.close()
+})
+
+test('project icons: preset glyph, letters and color, uploaded image, reset, persist', async () => {
+  const sb = makeSandbox()
+  let { app, page } = await launch(sb)
+  await addProject(app, page, sb.repoA)
+  const pj = page.locator('.pj').first()
+  const openPicker = async () => { await pj.click({ button: 'right' }); await page.click('#pmIcon') }
+
+  await openPicker()
+  await page.click('.pjopt[data-icon="rocket"]')
+  await page.click('#piSave')
+  await expect(pj.locator('svg')).toHaveCount(1)
+
+  await openPicker()
+  await page.click('.pjopt[data-icon="letters"]')
+  await page.fill('#piShort', 'xy')
+  await page.click('.pimodal .sw[aria-label="#8b5cf6"]')
+  await page.click('#piSave')
+  await expect(pj).toHaveText('XY')
+  await expect(pj).toHaveCSS('background-color', 'rgb(139, 92, 246)')
+
+  // a 1×1 PNG, square-cropped and stored as a data URL
+  const png = path.join(sb.base, 'logo.png')
+  fs.writeFileSync(png, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'))
+  await openPicker()
+  await page.setInputFiles('#piFile', png)
+  await expect(page.locator('.pimodal .pj.big')).toHaveAttribute('style', /data:image\/png/)
+  await page.click('#piSave')
+  await expect(pj).toHaveAttribute('style', /data:image\/png/)
+  await expect(pj).toHaveText('')
+
+  await app.close()
+  ;({ app, page } = await launch(sb))
+  await expect(page.locator('.pj').first()).toHaveAttribute('style', /data:image\/png/)
+  await page.locator('.pj').first().click({ button: 'right' }); await page.click('#pmIcon')
+  await page.click('#piReset'); await page.click('#piSave')
+  await expect(page.locator('.pj').first()).toHaveText('EC')
   await app.close()
 })

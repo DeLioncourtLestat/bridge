@@ -1,33 +1,45 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentEvent, ChatMessage, Commit, DiffOp, FileChange, Fork, Note, Ref, Settings, Task, TerminalInfo } from '../../../shared/types'
+import type { AgentEvent, ChatMessage, Commit, DiffOp, FileChange, Fork, Instruction, Note, Ref, Settings, Task, TerminalInfo } from '../../../shared/types'
+import { chatParts } from '../../../shared/markdown'
 import { bridge, svc } from '../api'
+import { chatMd, onMdClick } from '../chatMarkdown'
+import { OPEN_FILE_EVENT } from '../settings'
 import { DiffView, Icon, PRIO, useOutside, useUi } from '../ui'
 import { CodeEditor } from './CodeEditor'
 import { CommitModal } from './CommitModal'
+import { DocEditor } from './Docs'
+import { INSTR_PLACEHOLDER } from './InstructionsView'
 import { Xterm } from './Xterm'
 
-type View = 'chat' | 'changes' | 'files' | 'term' | 'git'
-type ForkUi = { view: View; file: string | null; change: string | null; commit: string | null; term: string | null }
-const LABEL: Record<View, string> = { chat: 'Chat', changes: 'Changes', files: 'Explorer', term: 'Terminal', git: 'Git' }
+type View = 'chat' | 'changes' | 'files' | 'term' | 'git' | 'instr'
+type ForkUi = { view: View; file: string | null; change: string | null; commit: string | null; term: string | null; dirs: string[]; instr: string | null }
+const LABEL: Record<View, string> = { chat: 'Chat', changes: 'Changes', files: 'Explorer', term: 'Terminal', git: 'Git', instr: 'Instructions' }
 
 type Props = {
   fork: Fork
   tasks: Task[]
   notes: Note[]
+  instructions: Instruction[]
+  reloadInstructions: () => Promise<void>
   settings: Settings
   onForkChanged: () => void
   onTasksChanged: () => void
 }
 
-export function ForkView({ fork, tasks, notes, settings, onForkChanged, onTasksChanged }: Props) {
+export function ForkView({ fork, tasks, notes, instructions, reloadInstructions, settings, onForkChanged, onTasksChanged }: Props) {
   const { fail, toast } = useUi()
-  const [fu, setFu] = useState<ForkUi>({ view: 'chat', file: null, change: null, commit: null, term: null })
+  const [fu, setFu] = useState<ForkUi>({ view: 'chat', file: null, change: null, commit: null, term: null, dirs: [], instr: null })
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [changes, setChanges] = useState<FileChange[]>([])
   const [files, setFiles] = useState<string[]>([])
   const [commits, setCommits] = useState<Commit[]>([])
   const [terms, setTerms] = useState<TerminalInfo[] | null>(null) // null until loaded
   const [commitOpen, setCommitOpen] = useState(false)
+  const [reveal, setReveal] = useState<{ line: number; n: number } | null>(null)
+  const [own, setOwn] = useState<Instruction[]>([])
+  const [freshInstr, setFreshInstr] = useState<string | null>(null) // just created: opens in edit mode
+  const reloadOwn = useCallback(async () => setOwn(await svc.listForkInstructions(fork.id)), [fork.id])
+  useEffect(() => { reloadOwn() }, [reloadOwn])
   const uiKey = `fork:${fork.id}`
 
   useEffect(() => { svc.getUi(uiKey).then((u) => setFu((cur) => ({ ...cur, ...(u as Partial<ForkUi>) }))) }, [uiKey])
@@ -73,49 +85,80 @@ export function ForkView({ fork, tasks, notes, settings, onForkChanged, onTasksC
     return () => clearInterval(id)
   }, [fu.view, refreshGit])
 
+  // search opens a file here, at a line
+  useEffect(() => {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent<{ forkId: string; file: string; line?: number }>).detail
+      if (d.forkId !== fork.id) return
+      setUi({ view: 'files', file: d.file })
+      setReveal(d.line ? { line: d.line, n: Date.now() } : null)
+      refreshGit()
+    }
+    window.addEventListener(OPEN_FILE_EVENT, h)
+    return () => window.removeEventListener(OPEN_FILE_EVENT, h)
+  }, [fork.id, setUi, refreshGit])
+
   const ahead = commits.filter((c) => !c.pushed).length
   const running = fork.state === 'run'
 
   const dot = (v: View) => (v === 'changes' && changes.length) || (v === 'git' && ahead) ? <span className="cdot" /> : null
 
   return (
-    <div className="ws">
-      <aside className="lp">
-        <div className="branch"><span className="b" title={`${fork.branch}\n${fork.path}`}>{fork.branch}</span></div>
-        <div className="itabs" role="tablist">
+    <div className={`ws${fu.view === 'chat' ? ' nolp' : ''}`}>
+      {fu.view !== 'chat' && (
+        <aside className="lp">
+          <div className="llist">
+            {fu.view === 'changes' && <ChangeList changes={changes} cur={fu.change} pick={(p) => setUi({ change: p })} />}
+            {fu.view === 'files' && <FileTree files={files} changes={changes} cur={fu.file} pick={(p) => { setReveal(null); setUi({ file: p }) }} dirs={fu.dirs ?? []} setDirs={(dirs) => setUi({ dirs })} />}
+            {fu.view === 'term' && terms && <TermList forkId={fork.id} terms={terms} cur={fu.term} pick={(id) => setUi({ term: id })} reload={reloadTerms} />}
+            {fu.view === 'instr' && (
+              <InstrList fork={fork} project={instructions} own={own} cur={fu.instr} pick={(k) => setUi({ instr: k })}
+                toggle={async (id, on) => { await svc.setInstructionOn(fork.id, id, on); onForkChanged() }}
+                add={async () => { const i = await svc.createInstruction(fork.projectId, { forkId: fork.id }); await reloadOwn(); setFreshInstr(`f:${i.id}`); setUi({ instr: `f:${i.id}` }) }} />
+            )}
+            {fu.view === 'git' && (
+              <GitList
+                commits={commits}
+                ahead={ahead}
+                changes={changes.length}
+                cur={fu.commit}
+                pick={(h) => setUi({ commit: h })}
+                onPull={() => svc.pull(fork.id).then((m) => { toast(m); refreshGit() }, fail)}
+                onPush={() => (ahead ? svc.push(fork.id).then((m) => { toast(m); refreshGit() }, fail) : toast('Nothing to push'))}
+                onCommit={() => setCommitOpen(true)}
+              />
+            )}
+          </div>
+        </aside>
+      )}
+      <section className="main">
+        {fu.view === 'chat' && <Chat fork={fork} messages={messages} setMessages={setMessages} tasks={tasks} notes={notes} running={running} onSent={() => { onForkChanged(); onTasksChanged() }} />}
+        {fu.view === 'changes' && <ChangeDiff forkId={fork.id} changes={changes} cur={fu.change} openInExplorer={(p) => setUi({ view: 'files', file: p })} />}
+        {fu.view === 'files' && <Explorer forkId={fork.id} files={files} cur={fu.file} settings={settings} onSaved={refreshGit} reveal={reveal} />}
+        {fu.view === 'term' && terms && <TermView forkId={fork.id} terms={terms} cur={fu.term} />}
+        {fu.view === 'git' && <CommitView forkId={fork.id} commits={commits} cur={fu.commit} />}
+        {fu.view === 'instr' && (
+          <InstrPane fork={fork} project={instructions} own={own} cur={fu.instr} fresh={freshInstr}
+            saved={async (scope) => { if (scope === 'p') await reloadInstructions(); else await reloadOwn() }}
+            removed={() => setUi({ instr: null })}
+            toggle={async (id, on) => { await svc.setInstructionOn(fork.id, id, on); onForkChanged() }} />
+        )}
+      </section>
+      <footer className="sbar">
+        <div className="branch" title={`${fork.branch}\n${fork.path}`}>
+          <span className="bi-ic">{Icon.git}</span><span className="b">{fork.branch}</span>
+          {fork.ghost ? <span className="kind ghost">{Icon.ghost}Ghost · shared project folder</span> : <span className="kind">Fork</span>}
+        </div>
+        <div className="itabs" role="tablist" aria-label="Fork views">
           {(Object.keys(LABEL) as View[]).map((v) => (
-            <button key={v} className="itab" data-v={v} aria-current={fu.view === v} title={LABEL[v]} aria-label={LABEL[v]} onClick={() => setUi({ view: v })}>
-              {Icon[v === 'files' ? 'files' : v]}
+            <button key={v} className="itab" data-v={v} aria-current={fu.view === v} title={LABEL[v]} onClick={() => setUi({ view: v })}>
+              {Icon[v]}<span>{LABEL[v]}</span>
               {dot(v)}
             </button>
           ))}
         </div>
-        <div className="llist">
-          {fu.view === 'chat' && <History messages={messages} />}
-          {fu.view === 'changes' && <ChangeList changes={changes} cur={fu.change} pick={(p) => setUi({ change: p })} />}
-          {fu.view === 'files' && <FileTree files={files} changes={changes} cur={fu.file} pick={(p) => setUi({ file: p })} />}
-          {fu.view === 'term' && terms && <TermList forkId={fork.id} terms={terms} cur={fu.term} pick={(id) => setUi({ term: id })} reload={reloadTerms} />}
-          {fu.view === 'git' && (
-            <GitList
-              commits={commits}
-              ahead={ahead}
-              changes={changes.length}
-              cur={fu.commit}
-              pick={(h) => setUi({ commit: h })}
-              onPull={() => svc.pull(fork.id).then((m) => { toast(m); refreshGit() }, fail)}
-              onPush={() => (ahead ? svc.push(fork.id).then((m) => { toast(m); refreshGit() }, fail) : toast('Nothing to push'))}
-              onCommit={() => setCommitOpen(true)}
-            />
-          )}
-        </div>
-      </aside>
-      <section className="main">
-        {fu.view === 'chat' && <Chat fork={fork} messages={messages} setMessages={setMessages} tasks={tasks} notes={notes} running={running} onSent={() => { onForkChanged(); onTasksChanged() }} />}
-        {fu.view === 'changes' && <ChangeDiff forkId={fork.id} changes={changes} cur={fu.change} openInExplorer={(p) => setUi({ view: 'files', file: p })} />}
-        {fu.view === 'files' && <Explorer forkId={fork.id} files={files} cur={fu.file} settings={settings} onSaved={refreshGit} />}
-        {fu.view === 'term' && terms && <TermView forkId={fork.id} terms={terms} cur={fu.term} />}
-        {fu.view === 'git' && <CommitView forkId={fork.id} commits={commits} cur={fu.commit} />}
-      </section>
+        <div className="sbr">{running && fu.view !== 'chat' && <span className="working"><i />Agent is working…</span>}</div>
+      </footer>
       {commitOpen && (
         <CommitModal
           fork={fork}
@@ -128,45 +171,83 @@ export function ForkView({ fork, tasks, notes, settings, onForkChanged, onTasksC
   )
 }
 
-/* ---------- chat ---------- */
+/* ---------- instructions ---------- */
 
-const plain = (s: string) => s.replace(/\s+/g, ' ').trim()
-
-function History({ messages }: { messages: ChatMessage[] }) {
-  const [cur, setCur] = useState(0)
-  useEffect(() => {
-    const box = document.getElementById('msgs')
-    if (!box) return
-    const sync = () => {
-      const top = box.getBoundingClientRect().top
-      let c = 0
-      box.querySelectorAll<HTMLElement>('.msg[data-i]').forEach((el) => { if (el.getBoundingClientRect().top - top < 40) c = Number(el.dataset.i) })
-      if (box.scrollTop + box.clientHeight >= box.scrollHeight - 4) c = messages.length - 1
-      setCur(c)
-    }
-    sync()
-    box.addEventListener('scroll', sync)
-    return () => box.removeEventListener('scroll', sync)
-  }, [messages])
-  if (!messages.length) return null
-  const jump = (i: number) => {
-    const el = document.getElementById(`msg-${i}`)
-    if (!el) return
-    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    el.classList.remove('flash')
-    void el.offsetWidth
-    el.classList.add('flash')
-  }
+/** Left column: the project's instructions with an on/off switch for this fork, then the fork's own. */
+function InstrList({ fork, project, own, cur, pick, toggle, add }: {
+  fork: Fork; project: Instruction[]; own: Instruction[]; cur: string | null
+  pick: (k: string) => void; toggle: (id: number, on: boolean) => void; add: () => void
+}) {
+  const sel = cur ?? (project[0] ? `p:${project[0].id}` : own[0] ? `f:${own[0].id}` : null)
+  const on = (id: number) => !fork.instrOff.includes(id)
   return (
     <>
-      <h4>History</h4>
-      {messages.map((m, i) => (
-        <button key={m.id} className="fi hist" data-jump={i} aria-current={i === cur} onClick={() => jump(i)}>
-          <span className={`hw ${m.role === 'user' ? 'me' : 'ai'}`}>{m.role === 'user' ? 'You' : m.role === 'error' ? 'Error' : 'Agent'}</span>
-          <span className="ht">{plain(m.text) || (m.tools.length ? m.tools[0] : '…')}</span>
+      <h4>Project</h4>
+      {project.length ? project.map((i) => (
+        <div key={i.id} className={`fi instr${on(i.id) ? '' : ' off'}`} aria-current={sel === `p:${i.id}`}>
+          <button className="tog sm" role="switch" aria-checked={on(i.id)} data-instr-on={i.id} aria-label={`Use “${i.title || 'Untitled'}” in this ${fork.ghost ? 'ghost' : 'fork'}`} onClick={() => toggle(i.id, !on(i.id))} />
+          <button className="it" data-pinstr={i.id} onClick={() => pick(`p:${i.id}`)}>{i.title || 'Untitled'}</button>
+        </div>
+      )) : <div className="hint" style={{ padding: '4px 8px 8px' }}>None yet. Add them in the Instructions tab at the top.</div>}
+      <div className="lhead"><h4>Only this {fork.ghost ? 'ghost' : 'fork'}</h4><button className="mini" id="addForkInstr" title="New instruction for this fork" aria-label="New instruction for this fork" onClick={add}>+</button></div>
+      {own.length ? own.map((i) => (
+        <button key={i.id} className="fi instr" data-finstr={i.id} aria-current={sel === `f:${i.id}`} onClick={() => pick(`f:${i.id}`)}>
+          <span className="it">{i.title || 'Untitled'}</span>
         </button>
-      ))}
+      )) : <div className="hint" style={{ padding: '4px 8px' }}>Press + to add one just for here.</div>}
     </>
+  )
+}
+
+function InstrPane({ fork, project, own, cur, fresh, saved, removed, toggle }: {
+  fork: Fork; project: Instruction[]; own: Instruction[]; cur: string | null; fresh: string | null
+  saved: (scope: 'p' | 'f') => Promise<void>; removed: () => void; toggle: (id: number, on: boolean) => void
+}) {
+  const { confirm, fail } = useUi()
+  const key = cur ?? (project[0] ? `p:${project[0].id}` : own[0] ? `f:${own[0].id}` : null)
+  const [scope, idStr] = (key ?? ':').split(':') as ['p' | 'f', string]
+  const doc = (scope === 'p' ? project : own).find((i) => i.id === Number(idStr))
+  if (!doc) return <div className="empty"><b>Instructions</b>The agent always follows the project’s instructions and the ones you add here. Switch project ones off on the left for this {fork.ghost ? 'ghost' : 'fork'} only.</div>
+  const on = !fork.instrOff.includes(doc.id)
+  const banner = scope === 'p' ? (
+    <div className="ibanner">
+      <span>{on ? 'Project instruction · editing it changes it for every fork' : 'Project instruction · switched off for this ' + (fork.ghost ? 'ghost' : 'fork')}</span>
+      <button className="btn" id="instrToggle" onClick={() => toggle(doc.id, !on)}>{on ? `Turn off here` : 'Turn on here'}</button>
+    </div>
+  ) : <div className="ibanner"><span>Only for this {fork.ghost ? 'ghost' : 'fork'}</span></div>
+  return (
+    <DocEditor key={key} doc={doc} kind="instr" placeholder={INSTR_PLACEHOLDER} banner={banner} autoEdit={fresh === key}
+      onSave={(d) => { svc.updateInstruction(d.id, { title: d.title, body: d.body }).then(() => saved(scope), fail) }}
+      onRemove={async () => {
+        if (!(await confirm({ title: 'Delete instruction?', text: `“${doc.title || 'Untitled'}” will be removed${scope === 'p' ? ' from the whole project' : ''}. This can’t be undone.` }))) return
+        await svc.removeInstruction(doc.id)
+        await saved(scope)
+        removed()
+      }} />
+  )
+}
+
+/* ---------- chat ---------- */
+
+/** Markdown chunk; re-parsed only when its text changes (replies stream in). */
+function Md({ text }: { text: string }) {
+  const html = useMemo(() => chatMd(text), [text])
+  return <div className="mdc body" onClick={onMdClick} dangerouslySetInnerHTML={{ __html: html }} />
+}
+
+/** "Read src/a.ts" → verb + target, the way Claude Code lists its steps. */
+function ToolRow({ t }: { t: string }) {
+  const m = t.match(/^(\S+)\s+(.*)$/)
+  return <div className="trow"><i />{m ? <><b>{m[1]}</b> <span>{m[2]}</span></> : <b>{t}</b>}</div>
+}
+
+function Tools({ tools, live }: { tools: string[]; live: boolean }) {
+  if (tools.length <= 3) return <div className="tools">{tools.map((t, k) => <ToolRow key={k} t={t} />)}</div>
+  return (
+    <details className="tools" open={live || undefined}>
+      <summary>{tools.length} steps<span>{tools[tools.length - 1]}</span></summary>
+      {tools.map((t, k) => <ToolRow key={k} t={t} />)}
+    </details>
   )
 }
 
@@ -185,6 +266,13 @@ function Chat({ fork, messages, setMessages, tasks, notes, running, onSent }: {
   useOutside(popRef, () => setPicker(null), !!picker)
   useEffect(() => { localStorage.setItem(draftKey, draft) }, [draft, draftKey])
   useEffect(() => { boxRef.current?.scrollTo({ top: boxRef.current.scrollHeight }) }, [messages.length])
+  // follow a streaming reply unless the user scrolled up to read
+  const last = messages[messages.length - 1]
+  const lastSig = last ? last.text.length + last.tools.length : 0
+  useEffect(() => {
+    const b = boxRef.current
+    if (b && b.scrollHeight - b.scrollTop - b.clientHeight < 120) b.scrollTo({ top: b.scrollHeight })
+  }, [lastSig])
   useEffect(() => { inputRef.current?.focus() }, [fork.id])
 
   const title = (r: Ref) => (r.kind === 'task' ? tasks.find((t) => t.id === r.id)?.title : notes.find((n) => n.id === r.id)?.title) ?? r.title ?? ''
@@ -216,14 +304,16 @@ function Chat({ fork, messages, setMessages, tasks, notes, running, onSent }: {
           ) : m.role === 'error' ? (
             <div key={m.id} className="msg err" id={`msg-${i}`} data-i={i}>{m.text}</div>
           ) : (
-            <div key={m.id} className="msg" id={`msg-${i}`} data-i={i}>
-              <div className="who">Agent</div>
-              {m.tools.length > 0 && <div className="tool">{m.tools.map((t, k) => <span key={k}>{t}</span>)}</div>}
-              <div className="body">{m.text}</div>
+            <div key={m.id} className="msg ai" id={`msg-${i}`} data-i={i}>
+              {chatParts(m.text, m.tools, m.marks ?? []).map((p, k) =>
+                p.kind === 'text' ? <Md key={k} text={p.text} /> : <Tools key={k} tools={p.tools} live={running && i === messages.length - 1} />,
+              )}
             </div>
           ),
         ) : (
-          <div className="empty-chat"><b>New fork</b>Pick a task or describe what to do. Add notes as references for extra context. The agent works in this fork’s own folder and never touches main.</div>
+          fork.ghost
+            ? <div className="empty-chat"><b>New ghost</b>Pick a task or describe what to do. This agent works directly in the project folder on <span className="mono">{fork.branch}</span>, next to you and any other ghosts.</div>
+            : <div className="empty-chat"><b>New fork</b>Pick a task or describe what to do. Add notes as references for extra context. The agent works in this fork’s own folder and never touches main.</div>
         )}
         {running && <div className="working"><i />Agent is working…</div>}
       </div>
@@ -306,17 +396,34 @@ function ChangeDiff({ forkId, changes, cur, openInExplorer }: { forkId: string; 
     <>
       <div className="mhead"><span className="p">{c.path}</span><span className="plusn">+{c.add}</span><span className="minusn">−{c.del}</span><span className="sp" />
         {c.kind !== 'D' && <button className="btn" id="openInFiles" onClick={() => openInExplorer(c.path)}>Open in Explorer</button>}</div>
-      <div className="mbody"><DiffView ops={ops} /></div>
+      <div className="mbody"><DiffView ops={ops} path={c.path} /></div>
     </>
   )
 }
 
 /* ---------- explorer ---------- */
 
-function FileTree({ files, changes, cur, pick }: { files: string[]; changes: FileChange[]; cur: string | null; pick: (p: string) => void }) {
+/** Folders start collapsed; the ones you open are remembered per fork. The open file's folders unfold on their own. */
+function FileTree({ files, changes, cur, pick, dirs, setDirs }: {
+  files: string[]; changes: FileChange[]; cur: string | null; pick: (p: string) => void; dirs: string[]; setDirs: (d: string[]) => void
+}) {
   const kinds = useMemo(() => Object.fromEntries(changes.map((c) => [c.path, c.kind])), [changes])
+  const open = useMemo(() => new Set(dirs), [dirs])
+  // folders that hold a changed file, so a collapsed folder still shows there's something inside
+  const changedDirs = useMemo(() => {
+    const out = new Set<string>()
+    for (const c of changes) { const parts = c.path.split('/'); for (let i = 1; i < parts.length; i++) out.add(parts.slice(0, i).join('/')) }
+    return out
+  }, [changes])
+  useEffect(() => {
+    if (!cur) return
+    const parts = cur.split('/')
+    const need = parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/')).filter((d) => !open.has(d))
+    if (need.length) setDirs([...dirs, ...need])
+  }, [cur]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const rows = useMemo(() => {
-    const out: { dir?: boolean; name: string; path?: string; depth: number }[] = []
+    const out: { dir?: boolean; name: string; path: string; depth: number }[] = []
     const seen = new Set<string>()
     // folders before files at every level, then by name
     const sorted = [...files].sort((x, y) => {
@@ -331,28 +438,35 @@ function FileTree({ files, changes, cur, pick }: { files: string[]; changes: Fil
     })
     for (const p of sorted) {
       const parts = p.split('/')
-      for (let i = 0; i < parts.length - 1; i++) {
+      let visible = true
+      for (let i = 0; i < parts.length - 1 && visible; i++) {
         const d = parts.slice(0, i + 1).join('/')
-        if (!seen.has(d)) { seen.add(d); out.push({ dir: true, name: parts[i], depth: i }) }
+        if (!seen.has(d)) { seen.add(d); out.push({ dir: true, name: parts[i], path: d, depth: i }) }
+        visible = open.has(d)
       }
-      out.push({ name: parts[parts.length - 1], path: p, depth: parts.length - 1 })
+      if (visible) out.push({ name: parts[parts.length - 1], path: p, depth: parts.length - 1 })
     }
     return out
-  }, [files])
+  }, [files, open])
+
+  const toggle = (d: string) => setDirs(open.has(d) ? dirs.filter((x) => x !== d && !x.startsWith(d + '/')) : [...dirs, d])
   return (
     <>
-      {rows.map((r, i) => r.dir ? (
-        <div key={'d' + i} className="fi dir" style={{ '--d': `${r.depth * 12}px` } as React.CSSProperties}>{r.name}/</div>
+      <div className="lhead"><h4>Files</h4>{dirs.length > 0 && <button className="mini" id="collapseAll" title="Collapse all" aria-label="Collapse all" onClick={() => setDirs([])}>−</button>}</div>
+      {rows.map((r) => r.dir ? (
+        <button key={'d:' + r.path} className="fi dir" data-dir={r.path} aria-expanded={open.has(r.path)} style={{ '--d': `${r.depth * 12}px` } as React.CSSProperties} onClick={() => toggle(r.path)}>
+          <span className="tw" />{r.name}{!open.has(r.path) && changedDirs.has(r.path) && <span className="ddot" title="Has changes" />}
+        </button>
       ) : (
-        <button key={r.path} className="fi" data-file={r.path} aria-current={r.path === cur} style={{ '--d': `${r.depth * 12}px` } as React.CSSProperties} onClick={() => pick(r.path!)}>
-          {r.name}{kinds[r.path!] && <span className={`st ${kinds[r.path!] === 'A' ? 'a' : 'm'}`}>{kinds[r.path!]}</span>}
+        <button key={r.path} className="fi file" data-file={r.path} aria-current={r.path === cur} style={{ '--d': `${r.depth * 12}px` } as React.CSSProperties} onClick={() => pick(r.path)}>
+          {r.name}{kinds[r.path] && <span className={`st ${kinds[r.path] === 'A' ? 'a' : 'm'}`}>{kinds[r.path]}</span>}
         </button>
       ))}
     </>
   )
 }
 
-function Explorer({ forkId, files, cur, settings, onSaved }: { forkId: string; files: string[]; cur: string | null; settings: Settings; onSaved: () => void }) {
+function Explorer({ forkId, files, cur, settings, onSaved, reveal }: { forkId: string; files: string[]; cur: string | null; settings: Settings; onSaved: () => void; reveal: { line: number; n: number } | null }) {
   const path = cur && files.includes(cur) ? cur : null
   const [doc, setDoc] = useState<{ path: string; content: string; head: string | null } | null>(null)
   const [saved, setSaved] = useState<'saved' | 'saving' | ''>('')
@@ -373,6 +487,7 @@ function Explorer({ forkId, files, cur, settings, onSaved }: { forkId: string; f
         value={doc.content}
         base={doc.head}
         settings={settings}
+        reveal={reveal}
         onSave={async (text) => {
           setSaved('saving')
           await svc.writeFile(forkId, path, text)
@@ -457,7 +572,7 @@ function CommitView({ forkId, commits, cur }: { forkId: string; commits: Commit[
       {files?.map((f) => (
         <div key={f.path}>
           <div className="mhead"><span className="p">{f.path}</span><span className="plusn">+{f.add}</span><span className="minusn">−{f.del}</span></div>
-          <DiffView ops={f.ops} />
+          <DiffView ops={f.ops} path={f.path} />
         </div>
       ))}
     </div>

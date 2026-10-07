@@ -107,3 +107,25 @@ export const toggleCheckbox = (src: string, line: number) => {
   lines[line] = lines[line].replace(/\[( |x|X)\]/, (_, c) => (c === ' ' ? '[x]' : '[ ]'))
   return lines.join('\n')
 }
+
+export type ChatPart = { kind: 'text'; text: string } | { kind: 'tools'; tools: string[] }
+
+/** Agent reply as it happened: text, then the tools called before the next paragraph, and so on.
+ *  Messages saved before marks existed show their tools first. */
+export function chatParts(text: string, tools: string[], marks: number[]): ChatPart[] {
+  const at = marks.length === tools.length ? marks : tools.map(() => 0)
+  const parts: ChatPart[] = []
+  let pos = 0
+  tools.forEach((t, i) => {
+    const cut = Math.min(Math.max(at[i], pos), text.length)
+    const chunk = text.slice(pos, cut).trim()
+    if (chunk) parts.push({ kind: 'text', text: chunk })
+    pos = cut
+    const last = parts[parts.length - 1]
+    if (last?.kind === 'tools') last.tools.push(t)
+    else parts.push({ kind: 'tools', tools: [t] })
+  })
+  const rest = text.slice(pos).trim()
+  if (rest) parts.push({ kind: 'text', text: rest })
+  return parts
+}

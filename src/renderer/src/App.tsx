@@ -1,25 +1,35 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Account, AgentEvent, Fork, Note, Project, Ref, Settings, Task } from '../../shared/types'
+import type { Account, AgentEvent, Fork, Instruction, Note, Project, Settings, Task } from '../../shared/types'
 import { bridge, svc } from './api'
 import { AccountMenu } from './components/AccountMenu'
-import { AssistantPanel } from './components/Assistant'
 import { ForkModal } from './components/ForkModal'
 import { ForkView } from './components/ForkView'
+import { InstructionsView } from './components/InstructionsView'
 import { NotesView } from './components/NotesView'
 import { SettingsModal } from './components/Settings'
 import { TasksView } from './components/TasksView'
-import { applySettings } from './settings'
-import { Icon, UiProvider, useUi } from './ui'
+import { ProjectIconModal, TileContent, tileStyle } from './components/ProjectIcon'
+import { SearchPopup, type SearchMode } from './components/Search'
+import { applySettings, keyRecording, OPEN_FILE_EVENT } from './settings'
+import { Icon, UiProvider, useOutside, useUi } from './ui'
 
 /** What each project remembers about how you left it. */
 export type ProjectUi = {
-  tab: string // 'tasks' | 'notes' | fork id
+  tab: string // 'tasks' | 'notes' | 'instructions' | fork id
   task: number | null
   note: number | null
+  instr: number | null
   taskFilter: 'all' | 'active' | 'done'
   taskSort: 'status' | 'prio'
 }
-const DEFAULT_UI: ProjectUi = { tab: 'tasks', task: null, note: null, taskFilter: 'all', taskSort: 'status' }
+const DEFAULT_UI: ProjectUi = { tab: 'tasks', task: null, note: null, instr: null, taskFilter: 'all', taskSort: 'status' }
+
+/** Fork tab state: spinner while the agent works, a check once it finished and you haven't looked yet. */
+function StateMark({ state }: { state: Fork['state'] }) {
+  if (state === 'run') return <span className="sq run" role="img" aria-label="Agent is working" title="Agent is working"><i className="spin" /></span>
+  if (state === 'wait') return <span className="sq wait" role="img" aria-label="Agent finished" title="Agent finished — not seen yet">{Icon.check}</span>
+  return <span className="sq idle" />
+}
 
 export function App() {
   return (
@@ -34,13 +44,18 @@ function Main() {
   const [projects, setProjects] = useState<Project[]>([])
   const [pid, setPid] = useState<string | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [pmenu, setPmenu] = useState<{ p: Project; x: number; y: number } | null>(null)
+  const [iconFor, setIconFor] = useState<Project | null>(null)
+  const [search, setSearch] = useState<SearchMode | null>(null)
+  const pmenuRef = useRef<HTMLDivElement>(null)
+  useOutside(pmenuRef, () => setPmenu(null), !!pmenu)
   const [accounts, setAccounts] = useState<Account[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
   const [notes, setNotes] = useState<Note[]>([])
+  const [instrs, setInstrs] = useState<Instruction[]>([])
   const [forksByProject, setForksByProject] = useState<Record<string, Fork[]>>({})
   const [pui, setPui] = useState<ProjectUi>(DEFAULT_UI)
   const [modal, setModal] = useState<null | 'fork' | 'settings'>(null)
-  const [helperOpen, setHelperOpen] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const project = projects.find((p) => p.id === pid) ?? null
   const forks = useMemo(() => (pid ? forksByProject[pid] ?? [] : []), [forksByProject, pid])
@@ -60,7 +75,10 @@ function Main() {
   pidRef.current = pid
   const reloadTasks = useCallback(async () => { if (!pid) return; const l = await svc.listTasks(pid); if (pidRef.current === pid) setTasks(l) }, [pid])
   const reloadNotes = useCallback(async () => { if (!pid) return; const l = await svc.listNotes(pid); if (pidRef.current === pid) setNotes(l) }, [pid])
+  const reloadInstrs = useCallback(async () => { if (!pid) return; const l = await svc.listInstructions(pid); if (pidRef.current === pid) setInstrs(l) }, [pid])
   const reloadAccounts = useCallback(async () => setAccounts(await svc.listAccounts()), [])
+  // the agent added or changed tasks / notes through its Bridge tools
+  useEffect(() => bridge().on('data:changed', (e: { projectId: string }) => { if (e.projectId === pidRef.current) { reloadTasks(); reloadNotes() } }), [reloadTasks, reloadNotes])
 
   // first load
   useEffect(() => {
@@ -82,10 +100,12 @@ function Main() {
     ;(async () => {
       setTasks([])
       setNotes([])
-      const [t, n, u] = await Promise.all([svc.listTasks(pid), svc.listNotes(pid), svc.getUi(pid)])
+      setInstrs([])
+      const [t, n, ins, u] = await Promise.all([svc.listTasks(pid), svc.listNotes(pid), svc.listInstructions(pid), svc.getUi(pid)])
       if (!alive) return
       setTasks(t)
       setNotes(n)
+      setInstrs(ins)
       setPui({ ...DEFAULT_UI, ...(u as Partial<ProjectUi>) })
     })()
     svc.setUi('app', { pid })
@@ -102,7 +122,7 @@ function Main() {
 
   // a closed or missing fork tab falls back to Tasks
   const activeFork = forks.find((f) => f.id === pui.tab && f.open) ?? null
-  const tab = activeFork ? activeFork.id : pui.tab === 'notes' ? 'notes' : 'tasks'
+  const tab = activeFork ? activeFork.id : pui.tab === 'notes' || pui.tab === 'instructions' ? pui.tab : 'tasks'
 
   // agent progress → fork states (tab squares, rail dots)
   useEffect(() => bridge().on('agent:event', (e: AgentEvent) => { if (e.kind !== 'update') reloadForks() }), [reloadForks])
@@ -128,19 +148,25 @@ function Main() {
     }
   }, [reloadProjects, reloadForks, ui])
 
+  // a notification was clicked: show that fork
+  useEffect(() => bridge().on('open-fork', (e: { projectId: string; forkId: string }) => {
+    if (e.projectId === pidRef.current) { reloadForks(); updatePui({ tab: e.forkId }) }
+    else setPid(e.projectId)
+  }), [reloadForks, updatePui])
+
   // app menu
   const menuRef = useRef<(name: string) => void>(() => {})
   menuRef.current = (name) => {
+    if (keyRecording.on) return // Settings is capturing a new shortcut
     if (name === 'open-project') addProject()
     else if (name === 'settings') setModal('settings')
     else if (!project) return
     else if (name === 'new-fork') setModal('fork')
-    else if (name === 'tasks' || name === 'notes') updatePui({ tab: name })
-    else if (name === 'assistant') setHelperOpen((v) => !v)
+    else if (name === 'tasks' || name === 'notes' || name === 'instructions') updatePui({ tab: name })
+    else if (name === 'find-in-files') setSearch('text')
+    else if (name === 'go-to-file') setSearch('files')
   }
   useEffect(() => bridge().on('menu', (n: string) => menuRef.current(n)), [])
-
-  const openRef = (r: Ref) => (r.kind === 'task' ? updatePui({ tab: 'tasks', task: r.id, taskFilter: 'all' }) : updatePui({ tab: 'notes', note: r.id }))
 
   const closeFork = async (f: Fork) => {
     await svc.setForkOpen(f.id, false)
@@ -159,18 +185,14 @@ function Main() {
           const states = (forksByProject[p.id] ?? []).map((f) => f.state)
           const st = states.includes('wait') ? 'wait' : states.includes('run') ? 'run' : ''
           return (
-            <button key={p.id} className="pj" data-proj={p.id} aria-current={p.id === pid} style={{ background: p.color }} title={`${p.name}\n${p.path}`} onClick={() => setPid(p.id)}>
-              {p.short}
-              {st && <span className={`st ${st}`} />}
+            <button key={p.id} className="pj" data-proj={p.id} aria-current={p.id === pid} style={tileStyle(p)} title={`${p.name}\n${p.path}`} onClick={() => setPid(p.id)}
+              onContextMenu={(e) => { e.preventDefault(); setPmenu({ p, x: e.clientX, y: e.clientY }) }}>
+              <TileContent p={p} />
+              {st && <span className={`st ${st}`} title={st === 'run' ? 'An agent is working' : 'An agent finished'}>{st === 'run' ? <i className="spin" /> : Icon.check}</span>}
             </button>
           )
         })}
         <button className="addp" id="addProj" title="Open project (⌘O)" aria-label="Open project" onClick={addProject}>+</button>
-        {project && (
-          <button className="hbtn" id="openHelper" title="Assistant (⌘J)" aria-label="Assistant" aria-pressed={helperOpen} onClick={() => setHelperOpen((v) => !v)}>
-            {Icon.spark}
-          </button>
-        )}
       </nav>
 
       <div className="app">
@@ -183,9 +205,13 @@ function Main() {
               <button className="tab" role="tab" data-tab="notes" aria-selected={tab === 'notes'} onClick={() => updatePui({ tab: 'notes' })}>
                 Notes <span className="n">{notes.length}</span>
               </button>
+              <button className="tab" role="tab" data-tab="instructions" aria-selected={tab === 'instructions'} onClick={() => updatePui({ tab: 'instructions' })}>
+                Instructions <span className="n">{instrs.length}</span>
+              </button>
               {forks.filter((f) => f.open).map((f) => (
                 <button key={f.id} className="tab" role="tab" data-tab={f.id} aria-selected={tab === f.id} title={f.branch} onClick={() => updatePui({ tab: f.id })}>
-                  <span className={`sq ${f.state}`} style={f.state === 'idle' ? { background: 'var(--faint)' } : undefined} />
+                  <StateMark state={f.state} />
+                  {f.ghost && <span className="ghi" title="Ghost: works in the project folder">{Icon.ghost}</span>}
                   {f.title}
                   <span className="x" role="button" aria-label="Close fork" onClick={(e) => { e.stopPropagation(); closeFork(f) }}>×</span>
                 </button>
@@ -209,12 +235,16 @@ function Main() {
             <TasksView key={project.id} pid={project.id} tasks={tasks} ui={pui} setUi={updatePui} reload={reloadTasks} />
           ) : tab === 'notes' ? (
             <NotesView key={project.id} pid={project.id} notes={notes} ui={pui} setUi={updatePui} reload={reloadNotes} />
+          ) : tab === 'instructions' ? (
+            <InstructionsView key={project.id} pid={project.id} items={instrs} ui={pui} setUi={updatePui} reload={reloadInstrs} />
           ) : activeFork ? (
             <ForkView
               key={activeFork.id}
               fork={activeFork}
               tasks={tasks}
               notes={notes}
+              instructions={instrs}
+              reloadInstructions={reloadInstrs}
               settings={settings}
               onForkChanged={reloadForks}
               onTasksChanged={reloadTasks}
@@ -223,16 +253,6 @@ function Main() {
         </div>
       </div>
 
-      {project && helperOpen && (
-        <AssistantPanel
-          project={project}
-          accounts={accounts}
-          settings={settings}
-          onClose={() => setHelperOpen(false)}
-          onChanged={() => { reloadTasks(); reloadNotes() }}
-          onOpen={openRef}
-        />
-      )}
       {modal === 'fork' && project && (
         <ForkModal
           project={project}
@@ -243,6 +263,28 @@ function Main() {
           onOpened={async (f) => { setModal(null); await reloadForks(); updatePui({ tab: f.id }) }}
         />
       )}
+      {pmenu && (
+        <div className="ctx" role="menu" ref={pmenuRef} style={{ left: pmenu.x, top: pmenu.y }} onKeyDown={(e) => e.key === 'Escape' && setPmenu(null)}>
+          <div className="ph">{pmenu.p.name}</div>
+          <button role="menuitem" id="pmIcon" onClick={() => { setIconFor(pmenu.p); setPmenu(null) }}><span className="chk" />Project icon…</button>
+          <button role="menuitem" onClick={() => { bridge().reveal(pmenu.p.path); setPmenu(null) }}><span className="chk" />Show in folder</button>
+        </div>
+      )}
+      {search && project && (
+        <SearchPopup
+          key={search}
+          mode={search}
+          target={{ projectId: project.id, forkId: activeFork?.id ?? null }}
+          where={activeFork ? `${activeFork.title} · ${activeFork.ghost ? 'project folder' : activeFork.branch}` : project.name}
+          canOpen={!!activeFork}
+          onClose={() => setSearch(null)}
+          onOpen={(file, line) => {
+            setSearch(null)
+            window.dispatchEvent(new CustomEvent(OPEN_FILE_EVENT, { detail: { forkId: activeFork!.id, file, line } }))
+          }}
+        />
+      )}
+      {iconFor && <ProjectIconModal project={iconFor} onClose={() => setIconFor(null)} onSaved={reloadProjects} />}
       {modal === 'settings' && (
         <SettingsModal
           settings={settings}

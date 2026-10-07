@@ -1,28 +1,11 @@
 import { useEffect, useRef } from 'react'
-import { css } from '@codemirror/lang-css'
-import { html } from '@codemirror/lang-html'
-import { javascript } from '@codemirror/lang-javascript'
-import { json } from '@codemirror/lang-json'
-import { markdown } from '@codemirror/lang-markdown'
-import { python } from '@codemirror/lang-python'
 import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from '@codemirror/state'
 import { Decoration, EditorView, gutter, GutterMarker, keymap, type DecorationSet } from '@codemirror/view'
 import { basicSetup } from 'codemirror'
 import { indentUnit, syntaxHighlighting } from '@codemirror/language'
-import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark'
+import { ideHighlighter, language } from '../syntax'
 import { changedLines } from '../../../shared/diff'
 import type { Settings } from '../../../shared/types'
-
-function language(path: string) {
-  const ext = path.split('.').pop()?.toLowerCase() ?? ''
-  if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs'].includes(ext)) return javascript({ typescript: ext.startsWith('t'), jsx: ext.endsWith('x') })
-  if (ext === 'json') return json()
-  if (['css', 'scss'].includes(ext)) return css()
-  if (['html', 'htm', 'vue', 'svelte'].includes(ext)) return html()
-  if (['md', 'markdown'].includes(ext)) return markdown()
-  if (ext === 'py') return python()
-  return []
-}
 
 const theme = EditorView.theme(
   {
@@ -30,15 +13,14 @@ const theme = EditorView.theme(
     '.cm-scroller': { fontFamily: 'var(--f-code)', lineHeight: 'var(--code-lh)' },
     '.cm-content': { caretColor: 'var(--fg-hi)', padding: '10px 0' },
     '.cm-cursor': { borderLeftColor: 'var(--fg-hi)' },
-    '.cm-gutters': { backgroundColor: 'transparent', color: '#525252', border: 'none' },
-    '.cm-activeLine': { backgroundColor: 'rgba(255,255,255,.03)' },
+    '.cm-gutters': { backgroundColor: 'transparent', color: 'var(--ln)', border: 'none' },
+    '.cm-activeLine': { backgroundColor: 'var(--hover-faint)' },
     '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--dim)' },
     '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'color-mix(in srgb, var(--accent) 35%, transparent) !important' },
-    '.cm-matchingBracket': { backgroundColor: 'rgba(255,255,255,.08)', outline: 'none' },
+    '.cm-matchingBracket': { backgroundColor: 'var(--raise)', outline: 'none' },
     '.cm-tooltip': { backgroundColor: 'var(--panel)', border: '1px solid var(--line-2)' },
     '.cm-panels': { backgroundColor: 'var(--panel)', color: 'var(--fg)' },
   },
-  { dark: true },
 )
 
 // changed-line highlighting against the file at HEAD
@@ -61,10 +43,10 @@ const changedGutter = gutter({
   lineMarkerChange: (u) => u.transactions.some((t) => t.effects.some((e) => e.is(setChanged))),
 })
 
-type Props = { path: string; value: string; base: string | null; settings: Settings; onSave: (text: string) => void }
+type Props = { path: string; value: string; base: string | null; settings: Settings; onSave: (text: string) => void; reveal?: { line: number; n: number } | null }
 
 /** Editable file with autosave; edited lines are highlighted against HEAD. */
-export function CodeEditor({ path, value, base, settings, onSave }: Props) {
+export function CodeEditor({ path, value, base, settings, onSave, reveal }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const view = useRef<EditorView | null>(null)
   const tab = useRef(new Compartment())
@@ -87,8 +69,8 @@ export function CodeEditor({ path, value, base, settings, onSave }: Props) {
         extensions: [
           basicSetup,
           theme,
-          syntaxHighlighting(oneDarkHighlightStyle),
-          language(path),
+          syntaxHighlighting(ideHighlighter), // colored by the syntax scheme's tokens in styles.css
+          language(path) ?? [],
           changedField,
           changedDecos,
           changedGutter,
@@ -108,6 +90,15 @@ export function CodeEditor({ path, value, base, settings, onSave }: Props) {
     return () => { flush(); v.destroy(); view.current = null }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
+
+  // jump to a line (from search): select it, center it, focus the editor
+  useEffect(() => {
+    const v = view.current
+    if (!v || !reveal) return
+    const line = v.state.doc.line(Math.min(Math.max(reveal.line, 1), v.state.doc.lines))
+    v.dispatch({ selection: { anchor: line.from, head: line.to }, effects: EditorView.scrollIntoView(line.from, { y: 'center' }) })
+    v.focus()
+  }, [reveal?.n, path]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     view.current?.dispatch({ effects: tab.current.reconfigure([EditorState.tabSize.of(settings.tabSize), indentUnit.of(' '.repeat(settings.tabSize))]) })

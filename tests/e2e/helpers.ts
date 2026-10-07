@@ -40,9 +40,13 @@ export function makeSandbox() {
     home,
     userData: path.join(base, 'userData'),
     fakeLog: path.join(base, 'fake-claude.log'),
+    notifyLog: path.join(base, 'notify.log'),
     repoA: mkRepo('easy-calendar'),
     repoB: mkRepo('shop-api'),
     plainDir: (() => { const d = path.join(projects, 'plain-folder'); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'a.txt'), 'x'); return d })(),
+    notices(): any[] {
+      return fs.existsSync(this.notifyLog) ? fs.readFileSync(this.notifyLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []
+    },
     readLog(): any[] {
       return fs.existsSync(this.fakeLog) ? fs.readFileSync(this.fakeLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []
     },
@@ -60,6 +64,7 @@ export async function launch(sb: Sandbox, extraEnv: Record<string, string> = {})
       BRIDGE_HOME: sb.home,
       BRIDGE_CLAUDE_BIN: path.join(ROOT, 'tests/fixtures/fake-claude.cjs'),
       BRIDGE_FAKE_LOG: sb.fakeLog,
+      BRIDGE_NOTIFY_LOG: sb.notifyLog,
       ...extraEnv,
     },
   })
@@ -84,4 +89,16 @@ export async function newItem(page: Page, kind: 'task' | 'note') {
 export async function addProject(app: ElectronApplication, page: Page, dir: string) {
   await stubFolder(app, dir)
   await page.click('#addProj')
+}
+
+/** Click an app menu item by label; returns its accelerator. */
+export async function menu(app: ElectronApplication, label: string, click = true) {
+  return app.evaluate(({ Menu }, a) => {
+    const find = (items: Electron.MenuItem[]): Electron.MenuItem | undefined => {
+      for (const i of items) { if (i.label === a.label) return i; const s = i.submenu && find(i.submenu.items); if (s) return s }
+    }
+    const item = find(Menu.getApplicationMenu()!.items)!
+    if (a.click) item.click()
+    return item.accelerator ?? null
+  }, { label, click })
 }

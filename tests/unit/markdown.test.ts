@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mdRender, mdSnippet, toggleCheckbox } from '../../src/shared/markdown'
+import { chatParts, mdRender, mdSnippet, toggleCheckbox } from '../../src/shared/markdown'
 
 describe('markdown', () => {
   it('renders headings, emphasis, code, links', () => {
@@ -41,5 +41,41 @@ describe('markdown', () => {
   it('toggles a checkbox line', () => {
     expect(toggleCheckbox('a\n- [ ] b\n- [x] c', 1)).toBe('a\n- [x] b\n- [x] c')
     expect(toggleCheckbox('a\n- [ ] b\n- [x] c', 2)).toBe('a\n- [ ] b\n- [ ] c')
+  })
+})
+
+describe('chatParts', () => {
+  it('puts tools between the paragraphs they were called after', () => {
+    const text = 'Looking.\n\nFixed it.'
+    expect(chatParts(text, ['Read a.ts', 'Edited a.ts'], [8, 8])).toEqual([
+      { kind: 'text', text: 'Looking.' },
+      { kind: 'tools', tools: ['Read a.ts', 'Edited a.ts'] },
+      { kind: 'text', text: 'Fixed it.' },
+    ])
+  })
+  it('shows tools first for messages without marks', () => {
+    expect(chatParts('Done', ['Read a.ts'], [])).toEqual([{ kind: 'tools', tools: ['Read a.ts'] }, { kind: 'text', text: 'Done' }])
+  })
+})
+
+describe('keymap and fuzzy search', () => {
+  it('formats and records shortcuts', async () => {
+    const { formatShortcut, shortcutFromEvent, shortcut } = await import('../../src/shared/keymap')
+    expect(formatShortcut('CmdOrCtrl+Shift+F', true)).toBe('⌘⇧F')
+    expect(formatShortcut('CmdOrCtrl+Shift+F', false)).toBe('Ctrl+Shift+F')
+    const ev = { code: 'KeyO', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true }
+    expect(shortcutFromEvent(ev, true)).toBe('CmdOrCtrl+Shift+O')
+    expect(shortcutFromEvent({ ...ev, metaKey: false, shiftKey: false }, true)).toBeNull() // plain typing
+    expect(shortcutFromEvent({ ...ev, code: 'ShiftLeft' }, true)).toBeNull()
+    expect(shortcut({}, 'go-to-file')).toBe('CmdOrCtrl+Shift+O')
+    expect(shortcut({ 'go-to-file': '' }, 'go-to-file')).toBe('')
+  })
+  it('ranks file name matches first', async () => {
+    const { fuzzy } = await import('../../src/shared/util')
+    const files = ['src/lib/util.ts', 'src/ui.tsx', 'tests/unit/tmp.ts']
+    const rank = (q: string) => files.map((f) => [f, fuzzy(f, q)] as const).filter((x) => x[1] !== null).sort((a, b) => b[1]! - a[1]!).map((x) => x[0])
+    expect(rank('utl')).toEqual(['src/lib/util.ts'])
+    expect(rank('ui')[0]).toBe('src/ui.tsx')
+    expect(fuzzy('src/app.ts', 'zz')).toBeNull()
   })
 })
